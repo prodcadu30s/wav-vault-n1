@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.*
+downloads/
+data/*.json
+npm-debug.log*
