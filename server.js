@@ -3,559 +3,684 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const axios = require("axios");
 const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
 const { Resend } = require("resend");
-const { S3Client, GetObjectCommand, HeadBucketCommand, HeadObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { Pool } = require("pg");
 
 dotenv.config();
 
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+app.use(cors());
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
-const app = express();
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
 
 const PORT = Number(process.env.PORT || 3000);
 const CLIENT_URL = process.env.CLIENT_URL || "";
 const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || "").replace(/\/$/, "");
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const PRODUCT_NAME = process.env.PRODUCT_NAME || "WAV Vault Vol. 1";
 const PRODUCT_PRICE = Number(process.env.PRODUCT_PRICE || 49.99);
 const DOWNLOAD_SESSION_MINUTES = Number(process.env.DOWNLOAD_SESSION_MINUTES || 15);
 const R2_URL_EXPIRES_SECONDS = Number(process.env.R2_URL_EXPIRES_SECONDS || 300);
-const ORDER_ACCESS_LINK_TTL_DAYS = Number(process.env.ORDER_ACCESS_LINK_TTL_DAYS || 0); // 0 = sem expiração
+const ORDER_ACCESS_LINK_TTL_DAYS = Number(process.env.ORDER_ACCESS_LINK_TTL_DAYS || 0);
+const MAX_DOWNLOADS_PER_ORDER = Number(process.env.MAX_DOWNLOADS_PER_ORDER || 5);
+const MAX_ACCESS_ATTEMPTS_PER_WINDOW = Number(process.env.MAX_ACCESS_ATTEMPTS_PER_WINDOW || 5);
+const ACCESS_ATTEMPT_WINDOW_MINUTES = Number(process.env.ACCESS_ATTEMPT_WINDOW_MINUTES || 15);
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
 const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || "";
 const R2_OBJECT_KEY = process.env.R2_OBJECT_KEY || "";
-const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || "";
 
-app.use(cors({ origin: CLIENT_URL ? [CLIENT_URL] : true }));
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
+const r2 =
+  R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY
+    ? new S3Client({
+        region: "auto",
+        endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+        credentials: {
+          accessKeyId: R2_ACCESS_KEY_ID,
+          secretAccessKey: R2_SECRET_ACCESS_KEY,
+        },
+      })
+    : null;
 
-const dataDir = path.join(__dirname, "data");
-const ordersFile = path.join(dataDir, "orders.json");
-
-function ensureStorage() {
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-  if (!fs.existsSync(ordersFile)) fs.writeFileSync(ordersFile, "{}", "utf-8");
+function logInfo(message, extra = {}) {
+  console.log(`[INFO] ${message}`, extra);
 }
 
-function readOrders() {
-  ensureStorage();
-  const raw = fs.readFileSync(ordersFile, "utf-8");
-  return raw ? JSON.parse(raw) : {};
+function logError(message, error, extra = {}) {
+  console.error(`[ERROR] ${message}`, {
+    ...extra,
+    message: error?.message,
+    response: error?.response?.data,
+  });
 }
 
-function writeOrders(orders) {
-  ensureStorage();
-  fs.writeFileSync(ordersFile, JSON.stringify(orders, null, 2), "utf-8");
+function randomToken(bytes = 24) {
+  return crypto.randomBytes(bytes).toString("hex");
 }
 
-function saveOrder(order) {
-  const orders = readOrders();
-  orders[order.id] = order;
-  writeOrders(orders);
-  return order;
+function addMinutes(date, minutes) {
+  return new Date(date.getTime() + minutes * 60 * 1000);
 }
 
-function getOrder(orderId) {
-  const orders = readOrders();
-  return orders[orderId] || null;
-}
-
-function findOrderByAccessToken(accessToken) {
-  const orders = readOrders();
-  return Object.values(orders).find((o) => o.accessToken === accessToken) || null;
-}
-
-function findOrderByPaymentId(paymentId) {
-  const orders = readOrders();
-  return Object.values(orders).find((o) => String(o.paymentId || "") === String(paymentId)) || null;
-}
-
-function findOrderByDownloadSession(sessionToken) {
-  const orders = readOrders();
-  return (
-    Object.values(orders).find((o) => {
-      if (!o.downloadSession) return false;
-      if (o.downloadSession.token !== sessionToken) return false;
-      if (o.downloadSession.usedAt) return false;
-      return new Date(o.downloadSession.expiresAt).getTime() > Date.now();
-    }) || null
-  );
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+function requireEnv(name, value) {
+  if (!value) {
+    throw new Error(`Variável ausente: ${name}`);
+  }
 }
 
-function generateOrderId() {
-  return `order_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+async function query(text, params = []) {
+  return pool.query(text, params);
 }
 
-function generateToken(bytes = 24) {
-  return crypto.randomBytes(bytes).toString("hex");
+async function initDb() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id BIGSERIAL PRIMARY KEY,
+      order_id TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL,
+      payment_id TEXT,
+      payment_status TEXT NOT NULL DEFAULT 'pending',
+      status TEXT NOT NULL DEFAULT 'pending',
+      access_token TEXT NOT NULL UNIQUE,
+      email_sent BOOLEAN NOT NULL DEFAULT FALSE,
+      email_sent_at TIMESTAMPTZ,
+      download_count INTEGER NOT NULL DEFAULT 0,
+      last_download_at TIMESTAMPTZ,
+      access_link_expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS download_sessions (
+      id BIGSERIAL PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+      session_token TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT FALSE,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS access_attempts (
+      id BIGSERIAL PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      email_attempt TEXT,
+      ip_address TEXT,
+      success BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_orders_access_token ON orders(access_token);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_download_sessions_token ON download_sessions(session_token);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_access_attempts_token_created_at ON access_attempts(access_token, created_at);`);
 }
 
-function buildAccessLink(accessToken) {
-  return `${BACKEND_PUBLIC_URL}/access/${accessToken}`;
-}
-
-function buildDownloadLink(sessionToken) {
-  return `${BACKEND_PUBLIC_URL}/download/${sessionToken}`;
-}
-
-function shouldUseNotificationUrl() {
-  return Boolean(BACKEND_PUBLIC_URL && /^https:\/\//i.test(BACKEND_PUBLIC_URL));
-}
-
-function isOrderAccessExpired(order) {
-  if (!ORDER_ACCESS_LINK_TTL_DAYS) return false;
-  if (!order.paidAt) return true;
-  const expiresAt = new Date(new Date(order.paidAt).getTime() + ORDER_ACCESS_LINK_TTL_DAYS * 24 * 60 * 60 * 1000);
-  return expiresAt.getTime() < Date.now();
-}
-
-function createDownloadSession(order) {
-  order.downloadSession = {
-    token: generateToken(24),
-    createdAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + DOWNLOAD_SESSION_MINUTES * 60 * 1000).toISOString(),
-    usedAt: null,
+function mpHeaders(idempotencyKey) {
+  const headers = {
+    Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+    "Content-Type": "application/json",
   };
-  saveOrder(order);
-  return order.downloadSession;
-}
 
-function getR2Client() {
-  if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-    throw new Error("Credenciais R2 não configuradas.");
+  if (idempotencyKey) {
+    headers["X-Idempotency-Key"] = idempotencyKey;
   }
 
-  return new S3Client({
-    region: "auto",
-    endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-      accessKeyId: R2_ACCESS_KEY_ID,
-      secretAccessKey: R2_SECRET_ACCESS_KEY,
-    },
-  });
+  return headers;
 }
 
-async function generateR2DownloadUrl() {
-  if (!R2_BUCKET_NAME || !R2_OBJECT_KEY) {
-    throw new Error("R2_BUCKET_NAME ou R2_OBJECT_KEY não configurado.");
-  }
-
-  const r2 = getR2Client();
-  const command = new GetObjectCommand({
-    Bucket: R2_BUCKET_NAME,
-    Key: R2_OBJECT_KEY,
-    ResponseContentDisposition: `attachment; filename="${path.basename(R2_OBJECT_KEY)}"`,
-  });
-
-  return await getSignedUrl(r2, command, { expiresIn: R2_URL_EXPIRES_SECONDS });
+async function getPaymentById(paymentId) {
+  const response = await axios.get(
+    `https://api.mercadopago.com/v1/payments/${paymentId}`,
+    { headers: mpHeaders() }
+  );
+  return response.data;
 }
 
-async function sendApprovedEmail(order) {
-  if (!resend || !EMAIL_FROM) {
-    console.warn("Resend/EMAIL_FROM não configurado. Email não enviado.");
-    return false;
-  }
+function extractWebhookPaymentId(req) {
+  return (
+    req.body?.data?.id ||
+    req.body?.resource?.split("/").pop() ||
+    req.query?.["data.id"] ||
+    req.query?.id ||
+    null
+  );
+}
 
-  const accessLink = buildAccessLink(order.accessToken);
+async function sendAccessEmail(order) {
+  if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) return false;
+
+  const accessUrl = `${BACKEND_PUBLIC_URL}/access/${order.access_token}`;
+  const expiresText = ORDER_ACCESS_LINK_TTL_DAYS > 0
+    ? `Este link-base pode expirar em ${ORDER_ACCESS_LINK_TTL_DAYS} dias.`
+    : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
 
   await resend.emails.send({
     from: EMAIL_FROM,
-    to: [order.email],
-    subject: `Seu acesso ao ${PRODUCT_NAME}`,
+    to: order.email,
+    subject: `${PRODUCT_NAME} — pagamento confirmado`,
     html: `
-      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;color:#111827;">
-        <h2>Pagamento aprovado 🎉</h2>
-        <p>Seu pedido do <strong>${PRODUCT_NAME}</strong> foi aprovado.</p>
-        <p>Guarde este email. Sempre que precisar baixar novamente, use o botão abaixo e confirme o email usado na compra.</p>
-        <p>
-          <a href="${accessLink}" style="display:inline-block;background:#111827;color:#ffffff;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700;">
-            Acessar meu download
-          </a>
-        </p>
-        <p>Se preferir, copie o link:</p>
-        <p>${accessLink}</p>
+      <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
+        <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
+        <p style="font-size:16px;line-height:1.6">Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.</p>
+        <p style="font-size:16px;line-height:1.6">Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.</p>
+        <div style="margin:28px 0">
+          <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">Acessar meu download</a>
+        </div>
+        <p style="font-size:14px;line-height:1.6;color:#444">${expiresText}</p>
+        <p style="font-size:14px;line-height:1.6;color:#444">Se o botão não funcionar, copie e cole este link no navegador:</p>
+        <p style="word-break:break-all;font-size:13px;color:#444">${accessUrl}</p>
       </div>
     `,
   });
 
+  await query(
+    `UPDATE orders SET email_sent = TRUE, email_sent_at = NOW(), updated_at = NOW() WHERE order_id = $1`,
+    [order.order_id]
+  );
+
   return true;
 }
 
-function renderAccessPage({ accessToken, error = "", success = "", email = "", showDownloadButton = false, downloadUrl = "" }) {
-  const errorHtml = error ? `<p style="color:#f87171;margin-top:14px;">${error}</p>` : "";
-  const successHtml = success ? `<p style="color:#4ade80;margin-top:14px;">${success}</p>` : "";
-  const downloadButton = showDownloadButton
-    ? `<a href="${downloadUrl}" style="display:block;margin-top:16px;width:100%;box-sizing:border-box;padding:14px;text-align:center;text-decoration:none;font-weight:700;border-radius:12px;background:#22c55e;color:#052e16;">Baixar arquivo agora</a>`
-    : "";
+async function finalizeApprovedPayment(paymentData) {
+  const orderId = paymentData.external_reference;
+  if (!orderId) return null;
 
-  return `<!doctype html>
-  <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Acessar download</title>
-      <style>
-        body { margin:0; font-family:Arial,sans-serif; background:#0f172a; color:#e2e8f0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-        .card { width:100%; max-width:520px; background:#111827; border:1px solid rgba(255,255,255,.08); border-radius:18px; padding:28px; box-shadow:0 20px 60px rgba(0,0,0,.35); }
-        h1 { margin-top:0; font-size:28px; line-height:1.2; }
-        p { color:#cbd5e1; line-height:1.5; }
-        label { display:block; margin:20px 0 8px; font-weight:600; }
-        input { width:100%; box-sizing:border-box; padding:14px; border-radius:12px; border:1px solid #334155; background:#0b1220; color:#e2e8f0; font-size:15px; }
-        button { margin-top:18px; width:100%; border:none; border-radius:12px; padding:14px; font-size:16px; font-weight:700; cursor:pointer; background:#38bdf8; color:#082f49; }
-        .muted { font-size:13px; color:#94a3b8; margin-top:14px; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>Baixar ${PRODUCT_NAME}</h1>
-        <p>Digite o email usado na compra para liberar seu download.</p>
-        <form method="POST" action="/access/${accessToken}">
-          <label for="email">Email da compra</label>
-          <input id="email" name="email" type="email" required placeholder="voce@exemplo.com" value="${email}" />
-          <button type="submit">Liberar download</button>
-        </form>
-        ${errorHtml}
-        ${successHtml}
-        ${downloadButton}
-        <p class="muted">O link do email continua útil. O arquivo real só é liberado temporariamente após a confirmação do email.</p>
-      </div>
-    </body>
-  </html>`;
-}
+  const result = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+  const order = result.rows[0];
+  if (!order) return null;
 
-function safeCompare(a, b) {
-  const aBuf = Buffer.from(String(a || ""));
-  const bBuf = Buffer.from(String(b || ""));
-  if (aBuf.length !== bBuf.length) return false;
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
+  await query(
+    `UPDATE orders
+     SET payment_id = $2,
+         payment_status = $3,
+         status = CASE WHEN $3 = 'approved' THEN 'approved' ELSE status END,
+         updated_at = NOW()
+     WHERE order_id = $1`,
+    [orderId, String(paymentData.id), paymentData.status]
+  );
 
-function verifyWebhookSignature(req) {
-  if (!MP_WEBHOOK_SECRET) return true;
-  const signatureHeader = req.headers["x-signature"];
-  if (!signatureHeader) return false;
-  return String(signatureHeader).includes(MP_WEBHOOK_SECRET);
-}
+  const updatedResult = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+  const updatedOrder = updatedResult.rows[0];
 
-async function fetchMercadoPagoPayment(paymentId) {
-  const response = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
-  });
-  return response.data;
-}
-
-async function markOrderApproved(order, payment) {
-  if (order.status === "approved") return order;
-
-  order.status = "approved";
-  order.paidAt = new Date().toISOString();
-  order.paymentId = payment.id || order.paymentId;
-  order.paymentStatus = payment.status || order.paymentStatus;
-  saveOrder(order);
-
-  try {
-    const sent = await sendApprovedEmail(order);
-    if (sent) {
-      order.emailSent = true;
-      order.emailSentAt = new Date().toISOString();
-      saveOrder(order);
+  if (paymentData.status === "approved" && !updatedOrder.email_sent) {
+    try {
+      await sendAccessEmail(updatedOrder);
+    } catch (error) {
+      logError("Falha ao enviar email após aprovação", error, { orderId });
     }
-  } catch (emailError) {
-    console.error("Erro ao enviar email:", emailError.response?.data || emailError.message);
   }
 
-  return order;
+  return updatedOrder;
 }
 
-app.get("/", async (req, res) => {
-  res.json({ ok: true, message: "Backend Mercado Pago + R2 rodando." });
-});
+async function reconcileOrder(order) {
+  if (!order?.payment_id || order.payment_status === "approved") {
+    return order;
+  }
+
+  try {
+    const paymentData = await getPaymentById(order.payment_id);
+    const updatedOrder = await finalizeApprovedPayment(paymentData);
+    return updatedOrder || order;
+  } catch (error) {
+    logError("Falha na reconciliação do pedido", error, { orderId: order.order_id });
+    return order;
+  }
+}
+
+async function validateWebhookSignature(req) {
+  if (!MP_WEBHOOK_SECRET) return true;
+
+  const signatureHeader = req.headers["x-signature"];
+  if (!signatureHeader) return false;
+
+  return true;
+}
+
+async function checkR2Health() {
+  if (!r2 || !R2_BUCKET_NAME || !R2_OBJECT_KEY) {
+    return { ok: false, error: "R2 não configurado" };
+  }
+
+  await r2.send(new HeadBucketCommand({ Bucket: R2_BUCKET_NAME }));
+  await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET_NAME, Key: R2_OBJECT_KEY }));
+  return { ok: true };
+}
 
 app.get("/health", async (req, res) => {
-  const health = {
+  let r2Ok = false;
+  let r2Error = null;
+
+  try {
+    const r2Check = await checkR2Health();
+    r2Ok = r2Check.ok;
+    r2Error = r2Check.error || null;
+  } catch (error) {
+    r2Ok = false;
+    r2Error = error.message;
+  }
+
+  res.json({
     ok: true,
     time: new Date().toISOString(),
     checks: {
-      backendPublicUrl: shouldUseNotificationUrl(),
-      resend: Boolean(process.env.RESEND_API_KEY && EMAIL_FROM),
+      backendPublicUrl: Boolean(BACKEND_PUBLIC_URL),
+      resend: Boolean(resend && EMAIL_FROM),
       mercadoPago: Boolean(MP_ACCESS_TOKEN),
-      r2: false,
+      r2: r2Ok,
+      postgres: Boolean(process.env.DATABASE_URL),
     },
-  };
-
-  try {
-    const r2 = getR2Client();
-    await r2.send(new HeadBucketCommand({ Bucket: R2_BUCKET_NAME }));
-    await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET_NAME, Key: R2_OBJECT_KEY }));
-    health.checks.r2 = true;
-  } catch (error) {
-    health.ok = false;
-    health.r2Error = error.message;
-  }
-
-  if (!health.checks.mercadoPago) health.ok = false;
-  if (!health.checks.resend) health.ok = false;
-
-  res.status(health.ok ? 200 : 500).json(health);
+    ...(r2Error ? { r2Error } : {}),
+  });
 });
 
 app.post("/create-pix", async (req, res) => {
   try {
-    const email = normalizeEmail(req.body.email);
-    const confirmEmail = normalizeEmail(req.body.confirmEmail);
+    requireEnv("MP_ACCESS_TOKEN", MP_ACCESS_TOKEN);
+
+    const email = normalizeEmail(req.body?.email);
+    const confirmEmail = normalizeEmail(req.body?.confirmEmail);
 
     if (!email || !confirmEmail) {
-      return res.status(400).json({ error: "Preencha os dois emails." });
+      return res.status(400).json({ success: false, error: "Preencha os dois campos de email." });
     }
 
     if (email !== confirmEmail) {
-      return res.status(400).json({ error: "Os emails não coincidem." });
+      return res.status(400).json({ success: false, error: "Os emails não coincidem." });
     }
 
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ error: "Email inválido." });
-    }
+    const orderId = `order_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+    const accessToken = randomToken(24);
+    const accessLinkExpiresAt = ORDER_ACCESS_LINK_TTL_DAYS > 0 ? addDays(new Date(), ORDER_ACCESS_LINK_TTL_DAYS) : null;
 
-    if (!MP_ACCESS_TOKEN) {
-      return res.status(500).json({ error: "MP_ACCESS_TOKEN não configurado." });
-    }
-
-    const orderId = generateOrderId();
-    const accessToken = generateToken(24);
-
-    const order = {
-      id: orderId,
-      email,
-      status: "pending",
-      paymentStatus: null,
-      paymentId: null,
-      accessToken,
-      createdAt: new Date().toISOString(),
-      paidAt: null,
-      emailSent: false,
-      emailSentAt: null,
-      downloadSession: null,
-      lastMpCheckAt: null,
-      amount: PRODUCT_PRICE,
-      productName: PRODUCT_NAME,
-    };
-
-    saveOrder(order);
+    await query(
+      `INSERT INTO orders (order_id, email, payment_status, status, access_token, access_link_expires_at)
+       VALUES ($1, $2, 'pending', 'pending', $3, $4)`,
+      [orderId, email, accessToken, accessLinkExpiresAt]
+    );
 
     const paymentData = {
       transaction_amount: PRODUCT_PRICE,
       description: PRODUCT_NAME,
       payment_method_id: "pix",
-      payer: { email },
       external_reference: orderId,
+      payer: { email },
     };
 
-    if (shouldUseNotificationUrl()) {
+    if (BACKEND_PUBLIC_URL.startsWith("https://")) {
       paymentData.notification_url = `${BACKEND_PUBLIC_URL}/webhook`;
     }
 
-    const response = await axios.post("https://api.mercadopago.com/v1/payments", paymentData, {
-      headers: {
-        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": orderId,
-      },
-    });
+    const paymentResponse = await axios.post(
+      "https://api.mercadopago.com/v1/payments",
+      paymentData,
+      { headers: mpHeaders(orderId) }
+    );
 
-    const payment = response.data;
-    order.paymentId = payment.id;
-    order.paymentStatus = payment.status || null;
-    saveOrder(order);
+    const payment = paymentResponse.data;
+
+    await query(
+      `UPDATE orders
+       SET payment_id = $2, payment_status = $3, updated_at = NOW()
+       WHERE order_id = $1`,
+      [orderId, String(payment.id), payment.status || "pending"]
+    );
+
+    logInfo("Pix criado", { orderId, paymentId: payment.id, email });
 
     return res.json({
       success: true,
       orderId,
       paymentId: payment.id,
       status: payment.status,
-      pixCode: payment.point_of_interaction?.transaction_data?.qr_code || null,
-      qrCodeBase64: payment.point_of_interaction?.transaction_data?.qr_code_base64 || null,
+      pixCode: payment.point_of_interaction?.transaction_data?.qr_code || "",
+      qrCodeBase64: payment.point_of_interaction?.transaction_data?.qr_code_base64 || "",
     });
   } catch (error) {
-    console.error("Erro ao criar Pix:", error.response?.data || error.message);
+    logError("Erro ao criar Pix", error);
     return res.status(500).json({
-      error: "Erro ao criar pagamento Pix.",
-      details: error.response?.data || error.message,
+      success: false,
+      error: error?.response?.data?.message || error.message || "Erro ao criar Pix.",
     });
   }
 });
 
 app.get("/payment-status/:orderId", async (req, res) => {
   try {
-    const order = getOrder(req.params.orderId);
+    const { orderId } = req.params;
+    const result = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+    let order = result.rows[0];
+
     if (!order) {
-      return res.status(404).json({ error: "Pedido não encontrado." });
+      return res.status(404).json({ success: false, error: "Pedido não encontrado." });
     }
 
-    if (order.paymentId && order.status !== "approved") {
-      try {
-        const payment = await fetchMercadoPagoPayment(order.paymentId);
-        order.lastMpCheckAt = new Date().toISOString();
-        order.paymentStatus = payment.status || order.paymentStatus;
-        saveOrder(order);
-
-        if (payment.status === "approved") {
-          await markOrderApproved(order, payment);
-        }
-      } catch (mpError) {
-        console.error("Falha ao reconciliar status do pagamento:", mpError.response?.data || mpError.message);
-      }
-    }
-
-    const freshOrder = getOrder(req.params.orderId);
+    order = await reconcileOrder(order);
 
     return res.json({
-      orderId: freshOrder.id,
-      status: freshOrder.status,
-      paymentStatus: freshOrder.paymentStatus,
-      emailSent: freshOrder.emailSent,
-      accessUrl: freshOrder.status === "approved" ? buildAccessLink(freshOrder.accessToken) : null,
+      orderId: order.order_id,
+      status: order.status,
+      paymentStatus: order.payment_status,
+      emailSent: order.email_sent,
+      accessUrl: order.status === "approved" && BACKEND_PUBLIC_URL
+        ? `${BACKEND_PUBLIC_URL}/access/${order.access_token}`
+        : null,
     });
   } catch (error) {
-    console.error("Erro em /payment-status:", error.message);
-    return res.status(500).json({ error: "Erro ao consultar status do pedido." });
+    logError("Erro ao consultar status do pagamento", error, { orderId: req.params.orderId });
+    return res.status(500).json({ success: false, error: "Erro ao consultar status." });
   }
 });
 
 app.post("/webhook", async (req, res) => {
   try {
-    if (!verifyWebhookSignature(req)) {
-      console.warn("Webhook rejeitado por assinatura inválida.");
-      return res.status(200).send("ok");
+    const validSignature = await validateWebhookSignature(req);
+    if (!validSignature) {
+      return res.status(401).json({ success: false, error: "Assinatura inválida." });
     }
 
-    const body = req.body || {};
-    const paymentId = body?.data?.id || body?.resource?.split("/").pop() || req.query["data.id"] || req.query.id;
-
+    const paymentId = extractWebhookPaymentId(req);
     if (!paymentId) {
-      return res.status(200).send("ok");
+      return res.status(200).json({ success: true, ignored: true });
     }
 
-    const payment = await fetchMercadoPagoPayment(paymentId);
-    const orderId = payment.external_reference;
-    if (!orderId) {
-      return res.status(200).send("ok");
-    }
+    const paymentData = await getPaymentById(paymentId);
+    const order = await finalizeApprovedPayment(paymentData);
 
-    const order = getOrder(orderId) || findOrderByPaymentId(paymentId);
-    if (!order) {
-      return res.status(200).send("ok");
-    }
+    logInfo("Webhook processado", {
+      paymentId,
+      orderId: paymentData.external_reference,
+      status: paymentData.status,
+      orderFound: Boolean(order),
+    });
 
-    order.paymentId = payment.id || order.paymentId;
-    order.paymentStatus = payment.status || order.paymentStatus;
-    order.lastMpCheckAt = new Date().toISOString();
-    saveOrder(order);
-
-    if (payment.status === "approved") {
-      await markOrderApproved(order, payment);
-    }
-
-    return res.status(200).send("ok");
+    return res.status(200).json({ success: true });
   } catch (error) {
-    console.error("Erro no webhook:", error.response?.data || error.message);
-    return res.status(200).send("ok");
+    logError("Erro no webhook", error);
+    return res.status(200).json({ success: false, handled: true });
   }
 });
 
-app.get("/access/:accessToken", (req, res) => {
-  const order = findOrderByAccessToken(req.params.accessToken);
+app.get("/access/:token", async (req, res) => {
+  const { token } = req.params;
+  const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
+  const order = result.rows[0];
 
-  if (!order || order.status !== "approved") {
-    return res.status(403).send("Link inválido ou pagamento não aprovado.");
+  if (!order) {
+    return res.status(404).send("<h1>Link inválido</h1><p>Pedido não encontrado.</p>");
   }
 
-  if (isOrderAccessExpired(order)) {
-    return res.status(403).send("O período deste link expirou. Entre em contato com o suporte.");
+  if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
+    return res.status(410).send("<h1>Link expirado</h1><p>Este link-base expirou.</p>");
   }
 
-  return res.status(200).send(renderAccessPage({ accessToken: req.params.accessToken }));
+  return res.send(`
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Acessar download</title>
+        <style>
+          body { font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:24px; box-sizing:border-box; }
+          .card { width:100%; max-width:520px; background:#161616; border:1px solid rgba(255,255,255,.08); border-radius:20px; padding:28px; }
+          h1 { margin:0 0 10px; font-size:28px; }
+          p { color:rgba(255,255,255,.78); line-height:1.6; }
+          input { width:100%; box-sizing:border-box; padding:14px; margin-top:14px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:#0f0f0f; color:#fff; }
+          button { width:100%; margin-top:16px; padding:14px; border:0; border-radius:12px; font-weight:700; cursor:pointer; }
+          .primary { background:#fff; color:#000; }
+          .error { margin-top:14px; padding:12px; background:rgba(255,70,70,.12); border:1px solid rgba(255,70,70,.25); border-radius:12px; display:none; }
+          .success { margin-top:14px; padding:14px; background:rgba(0,200,120,.12); border:1px solid rgba(0,200,120,.25); border-radius:12px; display:none; }
+          a.download { display:none; text-decoration:none; background:#fff; color:#000; padding:14px 18px; border-radius:12px; font-weight:700; margin-top:16px; text-align:center; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>${PRODUCT_NAME}</h1>
+          <p>Digite o email usado na compra para liberar seu download.</p>
+          <input id="email" type="email" placeholder="Seu email de compra" />
+          <button class="primary" id="submit">Liberar download</button>
+          <div class="error" id="error"></div>
+          <div class="success" id="success"></div>
+          <a class="download" id="downloadLink" href="#">Baixar arquivo</a>
+        </div>
+
+        <script>
+          const button = document.getElementById('submit');
+          const emailInput = document.getElementById('email');
+          const errorBox = document.getElementById('error');
+          const successBox = document.getElementById('success');
+          const downloadLink = document.getElementById('downloadLink');
+
+          button.addEventListener('click', async () => {
+            errorBox.style.display = 'none';
+            successBox.style.display = 'none';
+            downloadLink.style.display = 'none';
+            button.disabled = true;
+            button.textContent = 'Validando...';
+
+            try {
+              const response = await fetch('/access/${token}/confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: emailInput.value })
+              });
+
+              const data = await response.json();
+
+              if (!response.ok || !data.success) {
+                throw new Error(data.error || 'Não foi possível liberar o download.');
+              }
+
+              successBox.textContent = 'Tudo certo. Seu download foi liberado.';
+              successBox.style.display = 'block';
+              downloadLink.href = data.downloadUrl;
+              downloadLink.style.display = 'block';
+            } catch (error) {
+              errorBox.textContent = error.message || 'Erro ao validar acesso.';
+              errorBox.style.display = 'block';
+            } finally {
+              button.disabled = false;
+              button.textContent = 'Liberar download';
+            }
+          });
+        </script>
+      </body>
+    </html>
+  `);
 });
 
-app.post("/access/:accessToken", (req, res) => {
-  const order = findOrderByAccessToken(req.params.accessToken);
-  const typedEmail = normalizeEmail(req.body.email);
+app.post("/access/:token/confirm", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const email = normalizeEmail(req.body?.email);
+    const ipAddress = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || null;
 
-  if (!order || order.status !== "approved") {
-    return res.status(403).send("Link inválido ou pagamento não aprovado.");
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Informe o email da compra." });
+    }
+
+    const attemptsResult = await query(
+      `SELECT COUNT(*)::int AS total
+       FROM access_attempts
+       WHERE access_token = $1
+         AND created_at >= NOW() - ($2 || ' minutes')::interval
+         AND success = FALSE`,
+      [token, ACCESS_ATTEMPT_WINDOW_MINUTES]
+    );
+
+    if (attemptsResult.rows[0].total >= MAX_ACCESS_ATTEMPTS_PER_WINDOW) {
+      return res.status(429).json({ success: false, error: "Muitas tentativas. Tente novamente mais tarde." });
+    }
+
+    const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
+    const order = result.rows[0];
+
+    if (!order) {
+      await query(
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [token, email, ipAddress]
+      );
+      return res.status(404).json({ success: false, error: "Link inválido." });
+    }
+
+    if (order.status !== "approved") {
+      return res.status(400).json({ success: false, error: "Pagamento ainda não aprovado." });
+    }
+
+    if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
+      return res.status(410).json({ success: false, error: "Este link expirou." });
+    }
+
+    if (order.download_count >= MAX_DOWNLOADS_PER_ORDER) {
+      return res.status(403).json({ success: false, error: "Limite de downloads atingido para este pedido." });
+    }
+
+    if (normalizeEmail(order.email) !== email) {
+      await query(
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [token, email, ipAddress]
+      );
+      return res.status(401).json({ success: false, error: "Email diferente do usado na compra." });
+    }
+
+    await query(
+      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, TRUE)`,
+      [token, email, ipAddress]
+    );
+
+    const sessionToken = randomToken(24);
+    const expiresAt = addMinutes(new Date(), DOWNLOAD_SESSION_MINUTES);
+
+    await query(
+      `INSERT INTO download_sessions (order_id, session_token, expires_at, used)
+       VALUES ($1, $2, $3, FALSE)`,
+      [order.order_id, sessionToken, expiresAt]
+    );
+
+    logInfo("Sessão de download criada", { orderId: order.order_id, sessionToken });
+
+    return res.json({
+      success: true,
+      downloadUrl: `${BACKEND_PUBLIC_URL}/download/${sessionToken}`,
+      expiresAt,
+    });
+  } catch (error) {
+    logError("Erro ao confirmar acesso", error, { token: req.params.token });
+    return res.status(500).json({ success: false, error: "Erro ao validar acesso." });
   }
-
-  if (isOrderAccessExpired(order)) {
-    return res.status(403).send("O período deste link expirou. Entre em contato com o suporte.");
-  }
-
-  if (!typedEmail || !isValidEmail(typedEmail)) {
-    return res.status(400).send(renderAccessPage({
-      accessToken: req.params.accessToken,
-      email: typedEmail,
-      error: "Digite um email válido.",
-    }));
-  }
-
-  if (!safeCompare(typedEmail, normalizeEmail(order.email))) {
-    return res.status(401).send(renderAccessPage({
-      accessToken: req.params.accessToken,
-      email: typedEmail,
-      error: "Esse email não corresponde ao email usado na compra.",
-    }));
-  }
-
-  const session = createDownloadSession(order);
-  const downloadUrl = buildDownloadLink(session.token);
-
-  return res.status(200).send(renderAccessPage({
-    accessToken: req.params.accessToken,
-    email: typedEmail,
-    success: `Email confirmado. O botão abaixo fica válido por ${DOWNLOAD_SESSION_MINUTES} minutos.`,
-    showDownloadButton: true,
-    downloadUrl,
-  }));
 });
 
 app.get("/download/:sessionToken", async (req, res) => {
   try {
-    const order = findOrderByDownloadSession(req.params.sessionToken);
+    requireEnv("R2_BUCKET_NAME", R2_BUCKET_NAME);
+    requireEnv("R2_OBJECT_KEY", R2_OBJECT_KEY);
+    if (!r2) throw new Error("R2 não configurado.");
 
-    if (!order || order.status !== "approved") {
-      return res.status(403).send("Sessão de download inválida ou expirada.");
+    const { sessionToken } = req.params;
+    const sessionResult = await query(
+      `SELECT ds.*, o.download_count, o.order_id
+       FROM download_sessions ds
+       JOIN orders o ON o.order_id = ds.order_id
+       WHERE ds.session_token = $1
+       LIMIT 1`,
+      [sessionToken]
+    );
+
+    const session = sessionResult.rows[0];
+    if (!session) {
+      return res.status(404).send("Sessão de download não encontrada.");
     }
 
-    const signedUrl = await generateR2DownloadUrl();
-    order.downloadSession.usedAt = new Date().toISOString();
-    saveOrder(order);
+    if (session.used) {
+      return res.status(410).send("Este link de download já foi usado.");
+    }
+
+    if (new Date(session.expires_at) < new Date()) {
+      return res.status(410).send("Este link de download expirou.");
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: R2_OBJECT_KEY,
+    });
+
+    const signedUrl = await getSignedUrl(r2, command, {
+      expiresIn: R2_URL_EXPIRES_SECONDS,
+    });
+
+    await query(
+      `UPDATE download_sessions SET used = TRUE, used_at = NOW() WHERE session_token = $1`,
+      [sessionToken]
+    );
+
+    await query(
+      `UPDATE orders
+       SET download_count = download_count + 1,
+           last_download_at = NOW(),
+           updated_at = NOW()
+       WHERE order_id = $1`,
+      [session.order_id]
+    );
+
+    logInfo("Download liberado", { orderId: session.order_id, sessionToken });
 
     return res.redirect(signedUrl);
   } catch (error) {
-    console.error("Erro ao liberar download do R2:", error.message);
+    logError("Erro ao liberar download", error, { sessionToken: req.params.sessionToken });
     return res.status(500).send("Erro ao liberar download.");
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
+app.use((req, res) => {
+  return res.status(404).json({ success: false, error: "Rota não encontrada." });
 });
+
+async function start() {
+  try {
+    await initDb();
+    app.listen(PORT, () => {
+      console.log(`Servidor rodando em http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    logError("Erro ao iniciar servidor", error);
+    process.exit(1);
+  }
+}
+
+start();
