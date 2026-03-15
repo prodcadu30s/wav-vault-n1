@@ -49,6 +49,7 @@ const ORDER_ACCESS_LINK_TTL_DAYS = Number(process.env.ORDER_ACCESS_LINK_TTL_DAYS
 const MAX_DOWNLOADS_PER_ORDER = Number(process.env.MAX_DOWNLOADS_PER_ORDER || 5);
 const MAX_ACCESS_ATTEMPTS_PER_WINDOW = Number(process.env.MAX_ACCESS_ATTEMPTS_PER_WINDOW || 5);
 const ACCESS_ATTEMPT_WINDOW_MINUTES = Number(process.env.ACCESS_ATTEMPT_WINDOW_MINUTES || 15);
+const PIX_EXPIRATION_MINUTES = Number(process.env.PIX_EXPIRATION_MINUTES || 15);
 
 // 5 minutos para reduzir replay de webhook
 const WEBHOOK_MAX_AGE_MS = 5 * 60 * 1000;
@@ -238,7 +239,6 @@ function normalizeWebhookTimestamp(ts) {
   const raw = String(ts || "").trim();
   if (!/^\d+$/.test(raw)) return NaN;
 
-  // aceita segundos (10 dígitos) ou milissegundos (13 dígitos)
   if (raw.length <= 10) {
     return Number(raw) * 1000;
   }
@@ -472,6 +472,7 @@ app.get("/health", async (req, res) => {
       postgres: Boolean(process.env.DATABASE_URL),
       clientUrl: Boolean(CLIENT_URL),
       webhookSecret: Boolean(MP_WEBHOOK_SECRET),
+      pixExpirationMinutes: PIX_EXPIRATION_MINUTES,
     },
     ...(r2Error ? { r2Error } : {}),
   });
@@ -509,12 +510,17 @@ async function handleCreatePix(req, res) {
       [orderId, email, accessToken, accessLinkExpiresAt]
     );
 
+    const pixExpiresAt = new Date(
+      Date.now() + PIX_EXPIRATION_MINUTES * 60 * 1000
+    ).toISOString();
+
     const paymentData = {
       transaction_amount: PRODUCT_PRICE,
       description: PRODUCT_NAME,
       payment_method_id: "pix",
       external_reference: orderId,
       payer: { email },
+      date_of_expiration: pixExpiresAt,
     };
 
     if (BACKEND_PUBLIC_URL.startsWith("https://")) {
@@ -536,7 +542,12 @@ async function handleCreatePix(req, res) {
       [orderId, String(payment.id), payment.status || "pending"]
     );
 
-    logInfo("Pix criado", { orderId, paymentId: payment.id, email });
+    logInfo("Pix criado", {
+      orderId,
+      paymentId: payment.id,
+      email,
+      pixExpiresAt,
+    });
 
     return res.json({
       success: true,
@@ -545,6 +556,7 @@ async function handleCreatePix(req, res) {
       status: payment.status,
       pixCode: payment.point_of_interaction?.transaction_data?.qr_code || "",
       qrCodeBase64: payment.point_of_interaction?.transaction_data?.qr_code_base64 || "",
+      expiresAt: payment.date_of_expiration || pixExpiresAt,
     });
   } catch (error) {
     logError("Erro ao criar Pix", error);
