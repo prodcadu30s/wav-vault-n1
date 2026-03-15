@@ -567,9 +567,12 @@ app.post("/access/:token/confirm", async (req, res) => {
       return res.status(410).json({ success: false, error: "Este link expirou." });
     }
 
-    if (order.download_count >= MAX_DOWNLOADS_PER_ORDER) {
-      return res.status(403).json({ success: false, error: "Limite de downloads atingido para este pedido." });
-    }
+if (
+  Number(MAX_DOWNLOADS_PER_ORDER) > 0 &&
+  Number(order.download_count) >= Number(MAX_DOWNLOADS_PER_ORDER)
+) {
+  return res.status(403).send("Limite de downloads atingido");
+}
 
     if (normalizeEmail(order.email) !== email) {
       await query(
