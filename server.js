@@ -199,23 +199,46 @@ async function sendAccessEmail(order) {
       : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
 
   await resend.emails.send({
-    from: EMAIL_FROM,
-    to: order.email,
-    subject: `${PRODUCT_NAME} — pagamento confirmado`,
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
-        <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
-        <p style="font-size:16px;line-height:1.6">Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.</p>
-        <p style="font-size:16px;line-height:1.6">Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.</p>
-        <div style="margin:28px 0">
-          <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">Acessar meu download</a>
-        </div>
-        <p style="font-size:14px;line-height:1.6;color:#444">${expiresText}</p>
-        <p style="font-size:14px;line-height:1.6;color:#444">Se o botão não funcionar, copie e cole este link no navegador:</p>
-        <p style="word-break:break-all;font-size:13px;color:#444">${accessUrl}</p>
+  from: EMAIL_FROM,
+  to: order.email,
+  subject: `${PRODUCT_NAME} — pagamento confirmado`,
+  html: `
+    <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
+      <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
+      <p style="font-size:16px;line-height:1.6">
+        Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
+      </p>
+      <p style="font-size:16px;line-height:1.6">
+        Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
+      </p>
+
+      <p style="font-size:15px;line-height:1.6;color:#444">
+        <strong>Importante:</strong> este pedido permite até <strong>${MAX_DOWNLOADS_PER_ORDER} downloads</strong> do arquivo.
+      </p>
+
+      <div style="margin:28px 0">
+        <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">
+          Acessar meu download
+        </a>
       </div>
-    `,
-  });
+
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        ${expiresText}
+      </p>
+
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        Guarde este email para acessar novamente seu link quando precisar.
+      </p>
+
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        Se o botão não funcionar, copie e cole este link no navegador:
+      </p>
+      <p style="word-break:break-all;font-size:13px;color:#444">
+        ${accessUrl}
+      </p>
+    </div>
+  `,
+});
 
   await query(
     `UPDATE orders
