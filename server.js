@@ -16,8 +16,15 @@ const { Pool } = require("pg");
 dotenv.config();
 
 const app = express();
+
 app.use(express.json({ limit: "1mb" }));
-app.use(cors());
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-signature"],
+  })
+);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -181,7 +188,9 @@ function extractWebhookPaymentId(req) {
 }
 
 async function sendAccessEmail(order) {
-  if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) return false;
+  if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) {
+    return false;
+  }
 
   const accessUrl = `${BACKEND_PUBLIC_URL}/access/${order.access_token}`;
   const expiresText =
@@ -297,6 +306,8 @@ app.get("/", (req, res) => {
       createPix: "/api/mercadopago/create-pix",
       paymentStatus: "/api/mercadopago/payment-status/:orderId",
       webhook: "/api/mercadopago/webhook",
+      access: "/access/:token",
+      download: "/download/:sessionToken",
     },
   });
 });
@@ -323,6 +334,7 @@ app.get("/health", async (req, res) => {
       mercadoPago: Boolean(MP_ACCESS_TOKEN),
       r2: r2Ok,
       postgres: Boolean(process.env.DATABASE_URL),
+      clientUrl: Boolean(CLIENT_URL),
     },
     ...(r2Error ? { r2Error } : {}),
   });
