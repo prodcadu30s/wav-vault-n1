@@ -21,9 +21,7 @@ app.use(cors());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
 const resend = process.env.RESEND_API_KEY
@@ -72,6 +70,7 @@ function logError(message, error, extra = {}) {
     ...extra,
     message: error?.message,
     response: error?.response?.data,
+    stack: error?.stack,
   });
 }
 
@@ -185,9 +184,10 @@ async function sendAccessEmail(order) {
   if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) return false;
 
   const accessUrl = `${BACKEND_PUBLIC_URL}/access/${order.access_token}`;
-  const expiresText = ORDER_ACCESS_LINK_TTL_DAYS > 0
-    ? `Este link-base pode expirar em ${ORDER_ACCESS_LINK_TTL_DAYS} dias.`
-    : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
+  const expiresText =
+    ORDER_ACCESS_LINK_TTL_DAYS > 0
+      ? `Este link-base pode expirar em ${ORDER_ACCESS_LINK_TTL_DAYS} dias.`
+      : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
 
   await resend.emails.send({
     from: EMAIL_FROM,
@@ -209,7 +209,9 @@ async function sendAccessEmail(order) {
   });
 
   await query(
-    `UPDATE orders SET email_sent = TRUE, email_sent_at = NOW(), updated_at = NOW() WHERE order_id = $1`,
+    `UPDATE orders
+     SET email_sent = TRUE, email_sent_at = NOW(), updated_at = NOW()
+     WHERE order_id = $1`,
     [order.order_id]
   );
 
@@ -264,10 +266,14 @@ async function reconcileOrder(order) {
 }
 
 async function validateWebhookSignature(req) {
-  if (!MP_WEBHOOK_SECRET) return true;
+  if (!MP_WEBHOOK_SECRET) {
+    return true;
+  }
 
   const signatureHeader = req.headers["x-signature"];
-  if (!signatureHeader) return false;
+  if (!signatureHeader) {
+    return false;
+  }
 
   return true;
 }
@@ -282,6 +288,19 @@ async function checkR2Health() {
   return { ok: true };
 }
 
+app.get("/", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "API online.",
+    endpoints: {
+      health: "/health",
+      createPix: "/api/mercadopago/create-pix",
+      paymentStatus: "/api/mercadopago/payment-status/:orderId",
+      webhook: "/api/mercadopago/webhook",
+    },
+  });
+});
+
 app.get("/health", async (req, res) => {
   let r2Ok = false;
   let r2Error = null;
@@ -295,7 +314,7 @@ app.get("/health", async (req, res) => {
     r2Error = error.message;
   }
 
-  res.json({
+  return res.json({
     ok: true,
     time: new Date().toISOString(),
     checks: {
@@ -309,7 +328,7 @@ app.get("/health", async (req, res) => {
   });
 });
 
-app.post("/create-pix", async (req, res) => {
+async function handleCreatePix(req, res) {
   try {
     requireEnv("MP_ACCESS_TOKEN", MP_ACCESS_TOKEN);
 
@@ -317,16 +336,23 @@ app.post("/create-pix", async (req, res) => {
     const confirmEmail = normalizeEmail(req.body?.confirmEmail);
 
     if (!email || !confirmEmail) {
-      return res.status(400).json({ success: false, error: "Preencha os dois campos de email." });
+      return res.status(400).json({
+        success: false,
+        error: "Preencha os dois campos de email.",
+      });
     }
 
     if (email !== confirmEmail) {
-      return res.status(400).json({ success: false, error: "Os emails não coincidem." });
+      return res.status(400).json({
+        success: false,
+        error: "Os emails não coincidem.",
+      });
     }
 
     const orderId = `order_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
     const accessToken = randomToken(24);
-    const accessLinkExpiresAt = ORDER_ACCESS_LINK_TTL_DAYS > 0 ? addDays(new Date(), ORDER_ACCESS_LINK_TTL_DAYS) : null;
+    const accessLinkExpiresAt =
+      ORDER_ACCESS_LINK_TTL_DAYS > 0 ? addDays(new Date(), ORDER_ACCESS_LINK_TTL_DAYS) : null;
 
     await query(
       `INSERT INTO orders (order_id, email, payment_status, status, access_token, access_link_expires_at)
@@ -343,7 +369,7 @@ app.post("/create-pix", async (req, res) => {
     };
 
     if (BACKEND_PUBLIC_URL.startsWith("https://")) {
-      paymentData.notification_url = `${BACKEND_PUBLIC_URL}/webhook`;
+      paymentData.notification_url = `${BACKEND_PUBLIC_URL}/api/mercadopago/webhook`;
     }
 
     const paymentResponse = await axios.post(
@@ -378,16 +404,22 @@ app.post("/create-pix", async (req, res) => {
       error: error?.response?.data?.message || error.message || "Erro ao criar Pix.",
     });
   }
-});
+}
 
-app.get("/payment-status/:orderId", async (req, res) => {
+app.post("/create-pix", handleCreatePix);
+app.post("/api/mercadopago/create-pix", handleCreatePix);
+
+async function handlePaymentStatus(req, res) {
   try {
     const { orderId } = req.params;
     const result = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
     let order = result.rows[0];
 
     if (!order) {
-      return res.status(404).json({ success: false, error: "Pedido não encontrado." });
+      return res.status(404).json({
+        success: false,
+        error: "Pedido não encontrado.",
+      });
     }
 
     order = await reconcileOrder(order);
@@ -397,26 +429,59 @@ app.get("/payment-status/:orderId", async (req, res) => {
       status: order.status,
       paymentStatus: order.payment_status,
       emailSent: order.email_sent,
-      accessUrl: order.status === "approved" && BACKEND_PUBLIC_URL
-        ? `${BACKEND_PUBLIC_URL}/access/${order.access_token}`
-        : null,
+      accessUrl:
+        order.status === "approved" && BACKEND_PUBLIC_URL
+          ? `${BACKEND_PUBLIC_URL}/access/${order.access_token}`
+          : null,
     });
   } catch (error) {
-    logError("Erro ao consultar status do pagamento", error, { orderId: req.params.orderId });
-    return res.status(500).json({ success: false, error: "Erro ao consultar status." });
+    logError("Erro ao consultar status do pagamento", error, {
+      orderId: req.params.orderId,
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Erro ao consultar status.",
+    });
   }
+}
+
+app.get("/payment-status/:orderId", handlePaymentStatus);
+app.get("/api/mercadopago/payment-status/:orderId", handlePaymentStatus);
+
+app.get("/webhook", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "Webhook Mercado Pago online.",
+    route: "/webhook",
+  });
 });
 
-app.post("/webhook", async (req, res) => {
+app.get("/api/mercadopago/webhook", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "Webhook Mercado Pago online.",
+    route: "/api/mercadopago/webhook",
+  });
+});
+
+async function handleWebhook(req, res) {
   try {
     const validSignature = await validateWebhookSignature(req);
+
     if (!validSignature) {
-      return res.status(401).json({ success: false, error: "Assinatura inválida." });
+      return res.status(401).json({
+        success: false,
+        error: "Assinatura inválida.",
+      });
     }
 
     const paymentId = extractWebhookPaymentId(req);
+
     if (!paymentId) {
-      return res.status(200).json({ success: true, ignored: true });
+      return res.status(200).json({
+        success: true,
+        ignored: true,
+      });
     }
 
     const paymentData = await getPaymentById(paymentId);
@@ -434,105 +499,119 @@ app.post("/webhook", async (req, res) => {
     logError("Erro no webhook", error);
     return res.status(200).json({ success: false, handled: true });
   }
-});
+}
+
+app.post("/webhook", handleWebhook);
+app.post("/api/mercadopago/webhook", handleWebhook);
 
 app.get("/access/:token", async (req, res) => {
-  const { token } = req.params;
-  const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
-  const order = result.rows[0];
+  try {
+    const { token } = req.params;
+    const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
+    const order = result.rows[0];
 
-  if (!order) {
-    return res.status(404).send("<h1>Link inválido</h1><p>Pedido não encontrado.</p>");
-  }
+    if (!order) {
+      return res.status(404).send("<h1>Link inválido</h1><p>Pedido não encontrado.</p>");
+    }
 
-  if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
-    return res.status(410).send("<h1>Link expirado</h1><p>Este link-base expirou.</p>");
-  }
+    if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
+      return res.status(410).send("<h1>Link expirado</h1><p>Este link-base expirou.</p>");
+    }
 
-  return res.send(`
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Acessar download</title>
-        <style>
-          body { font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:24px; box-sizing:border-box; }
-          .card { width:100%; max-width:520px; background:#161616; border:1px solid rgba(255,255,255,.08); border-radius:20px; padding:28px; }
-          h1 { margin:0 0 10px; font-size:28px; }
-          p { color:rgba(255,255,255,.78); line-height:1.6; }
-          input { width:100%; box-sizing:border-box; padding:14px; margin-top:14px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:#0f0f0f; color:#fff; }
-          button { width:100%; margin-top:16px; padding:14px; border:0; border-radius:12px; font-weight:700; cursor:pointer; }
-          .primary { background:#fff; color:#000; }
-          .error { margin-top:14px; padding:12px; background:rgba(255,70,70,.12); border:1px solid rgba(255,70,70,.25); border-radius:12px; display:none; }
-          .success { margin-top:14px; padding:14px; background:rgba(0,200,120,.12); border:1px solid rgba(0,200,120,.25); border-radius:12px; display:none; }
-          a.download { display:none; text-decoration:none; background:#fff; color:#000; padding:14px 18px; border-radius:12px; font-weight:700; margin-top:16px; text-align:center; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>${PRODUCT_NAME}</h1>
-          <p>Digite o email usado na compra para liberar seu download.</p>
-          <input id="email" type="email" placeholder="Seu email de compra" />
-          <button class="primary" id="submit">Liberar download</button>
-          <div class="error" id="error"></div>
-          <div class="success" id="success"></div>
-          <a class="download" id="downloadLink" href="#">Baixar arquivo</a>
-        </div>
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Acessar download</title>
+          <style>
+            body { font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:24px; box-sizing:border-box; }
+            .card { width:100%; max-width:520px; background:#161616; border:1px solid rgba(255,255,255,.08); border-radius:20px; padding:28px; }
+            h1 { margin:0 0 10px; font-size:28px; }
+            p { color:rgba(255,255,255,.78); line-height:1.6; }
+            input { width:100%; box-sizing:border-box; padding:14px; margin-top:14px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:#0f0f0f; color:#fff; }
+            button { width:100%; margin-top:16px; padding:14px; border:0; border-radius:12px; font-weight:700; cursor:pointer; }
+            .primary { background:#fff; color:#000; }
+            .error { margin-top:14px; padding:12px; background:rgba(255,70,70,.12); border:1px solid rgba(255,70,70,.25); border-radius:12px; display:none; }
+            .success { margin-top:14px; padding:14px; background:rgba(0,200,120,.12); border:1px solid rgba(0,200,120,.25); border-radius:12px; display:none; }
+            a.download { display:none; text-decoration:none; background:#fff; color:#000; padding:14px 18px; border-radius:12px; font-weight:700; margin-top:16px; text-align:center; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>${PRODUCT_NAME}</h1>
+            <p>Digite o email usado na compra para liberar seu download.</p>
+            <input id="email" type="email" placeholder="Seu email de compra" />
+            <button class="primary" id="submit">Liberar download</button>
+            <div class="error" id="error"></div>
+            <div class="success" id="success"></div>
+            <a class="download" id="downloadLink" href="#">Baixar arquivo</a>
+          </div>
 
-        <script>
-          const button = document.getElementById('submit');
-          const emailInput = document.getElementById('email');
-          const errorBox = document.getElementById('error');
-          const successBox = document.getElementById('success');
-          const downloadLink = document.getElementById('downloadLink');
+          <script>
+            const button = document.getElementById('submit');
+            const emailInput = document.getElementById('email');
+            const errorBox = document.getElementById('error');
+            const successBox = document.getElementById('success');
+            const downloadLink = document.getElementById('downloadLink');
 
-          button.addEventListener('click', async () => {
-            errorBox.style.display = 'none';
-            successBox.style.display = 'none';
-            downloadLink.style.display = 'none';
-            button.disabled = true;
-            button.textContent = 'Validando...';
+            button.addEventListener('click', async () => {
+              errorBox.style.display = 'none';
+              successBox.style.display = 'none';
+              downloadLink.style.display = 'none';
+              button.disabled = true;
+              button.textContent = 'Validando...';
 
-            try {
-              const response = await fetch('/access/${token}/confirm', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: emailInput.value })
-              });
+              try {
+                const response = await fetch('/access/${token}/confirm', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ email: emailInput.value })
+                });
 
-              const data = await response.json();
+                const data = await response.json();
 
-              if (!response.ok || !data.success) {
-                throw new Error(data.error || 'Não foi possível liberar o download.');
+                if (!response.ok || !data.success) {
+                  throw new Error(data.error || 'Não foi possível liberar o download.');
+                }
+
+                successBox.textContent = 'Tudo certo. Seu download foi liberado.';
+                successBox.style.display = 'block';
+                downloadLink.href = data.downloadUrl;
+                downloadLink.style.display = 'block';
+              } catch (error) {
+                errorBox.textContent = error.message || 'Erro ao validar acesso.';
+                errorBox.style.display = 'block';
+              } finally {
+                button.disabled = false;
+                button.textContent = 'Liberar download';
               }
-
-              successBox.textContent = 'Tudo certo. Seu download foi liberado.';
-              successBox.style.display = 'block';
-              downloadLink.href = data.downloadUrl;
-              downloadLink.style.display = 'block';
-            } catch (error) {
-              errorBox.textContent = error.message || 'Erro ao validar acesso.';
-              errorBox.style.display = 'block';
-            } finally {
-              button.disabled = false;
-              button.textContent = 'Liberar download';
-            }
-          });
-        </script>
-      </body>
-    </html>
-  `);
+            });
+          </script>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    logError("Erro ao abrir página de acesso", error, { token: req.params.token });
+    return res.status(500).send("Erro ao abrir página de acesso.");
+  }
 });
 
 app.post("/access/:token/confirm", async (req, res) => {
   try {
     const { token } = req.params;
     const email = normalizeEmail(req.body?.email);
-    const ipAddress = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || null;
+    const ipAddress =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket.remoteAddress ||
+      null;
 
     if (!email) {
-      return res.status(400).json({ success: false, error: "Informe o email da compra." });
+      return res.status(400).json({
+        success: false,
+        error: "Informe o email da compra.",
+      });
     }
 
     const attemptsResult = await query(
@@ -545,7 +624,10 @@ app.post("/access/:token/confirm", async (req, res) => {
     );
 
     if (attemptsResult.rows[0].total >= MAX_ACCESS_ATTEMPTS_PER_WINDOW) {
-      return res.status(429).json({ success: false, error: "Muitas tentativas. Tente novamente mais tarde." });
+      return res.status(429).json({
+        success: false,
+        error: "Muitas tentativas. Tente novamente mais tarde.",
+      });
     }
 
     const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
@@ -553,37 +635,55 @@ app.post("/access/:token/confirm", async (req, res) => {
 
     if (!order) {
       await query(
-        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
+         VALUES ($1, $2, $3, FALSE)`,
         [token, email, ipAddress]
       );
-      return res.status(404).json({ success: false, error: "Link inválido." });
+      return res.status(404).json({
+        success: false,
+        error: "Link inválido.",
+      });
     }
 
     if (order.status !== "approved") {
-      return res.status(400).json({ success: false, error: "Pagamento ainda não aprovado." });
+      return res.status(400).json({
+        success: false,
+        error: "Pagamento ainda não aprovado.",
+      });
     }
 
     if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
-      return res.status(410).json({ success: false, error: "Este link expirou." });
+      return res.status(410).json({
+        success: false,
+        error: "Este link expirou.",
+      });
     }
 
-if (
-  Number(MAX_DOWNLOADS_PER_ORDER) > 0 &&
-  Number(order.download_count) >= Number(MAX_DOWNLOADS_PER_ORDER)
-) {
-  return res.status(403).send("Limite de downloads atingido");
-}
+    if (
+      Number(MAX_DOWNLOADS_PER_ORDER) > 0 &&
+      Number(order.download_count) >= Number(MAX_DOWNLOADS_PER_ORDER)
+    ) {
+      return res.status(403).json({
+        success: false,
+        error: "Limite de downloads atingido.",
+      });
+    }
 
     if (normalizeEmail(order.email) !== email) {
       await query(
-        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
+         VALUES ($1, $2, $3, FALSE)`,
         [token, email, ipAddress]
       );
-      return res.status(401).json({ success: false, error: "Email diferente do usado na compra." });
+      return res.status(401).json({
+        success: false,
+        error: "Email diferente do usado na compra.",
+      });
     }
 
     await query(
-      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, TRUE)`,
+      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
+       VALUES ($1, $2, $3, TRUE)`,
       [token, email, ipAddress]
     );
 
@@ -596,7 +696,10 @@ if (
       [order.order_id, sessionToken, expiresAt]
     );
 
-    logInfo("Sessão de download criada", { orderId: order.order_id, sessionToken });
+    logInfo("Sessão de download criada", {
+      orderId: order.order_id,
+      sessionToken,
+    });
 
     return res.json({
       success: true,
@@ -605,7 +708,10 @@ if (
     });
   } catch (error) {
     logError("Erro ao confirmar acesso", error, { token: req.params.token });
-    return res.status(500).json({ success: false, error: "Erro ao validar acesso." });
+    return res.status(500).json({
+      success: false,
+      error: "Erro ao validar acesso.",
+    });
   }
 });
 
@@ -613,9 +719,13 @@ app.get("/download/:sessionToken", async (req, res) => {
   try {
     requireEnv("R2_BUCKET_NAME", R2_BUCKET_NAME);
     requireEnv("R2_OBJECT_KEY", R2_OBJECT_KEY);
-    if (!r2) throw new Error("R2 não configurado.");
+
+    if (!r2) {
+      throw new Error("R2 não configurado.");
+    }
 
     const { sessionToken } = req.params;
+
     const sessionResult = await query(
       `SELECT ds.*, o.download_count, o.order_id
        FROM download_sessions ds
@@ -626,6 +736,7 @@ app.get("/download/:sessionToken", async (req, res) => {
     );
 
     const session = sessionResult.rows[0];
+
     if (!session) {
       return res.status(404).send("Sessão de download não encontrada.");
     }
@@ -648,7 +759,9 @@ app.get("/download/:sessionToken", async (req, res) => {
     });
 
     await query(
-      `UPDATE download_sessions SET used = TRUE, used_at = NOW() WHERE session_token = $1`,
+      `UPDATE download_sessions
+       SET used = TRUE, used_at = NOW()
+       WHERE session_token = $1`,
       [sessionToken]
     );
 
@@ -661,24 +774,34 @@ app.get("/download/:sessionToken", async (req, res) => {
       [session.order_id]
     );
 
-    logInfo("Download liberado", { orderId: session.order_id, sessionToken });
+    logInfo("Download liberado", {
+      orderId: session.order_id,
+      sessionToken,
+    });
 
     return res.redirect(signedUrl);
   } catch (error) {
-    logError("Erro ao liberar download", error, { sessionToken: req.params.sessionToken });
+    logError("Erro ao liberar download", error, {
+      sessionToken: req.params.sessionToken,
+    });
     return res.status(500).send("Erro ao liberar download.");
   }
 });
 
 app.use((req, res) => {
-  return res.status(404).json({ success: false, error: "Rota não encontrada." });
+  return res.status(404).json({
+    success: false,
+    error: "Rota não encontrada.",
+  });
 });
 
 async function start() {
   try {
     await initDb();
+
     app.listen(PORT, () => {
-      console.log(`Servidor rodando em http://localhost:${PORT}`);
+      console.log(`Servidor rodando na porta ${PORT}`);
+      console.log(`URL pública esperada: ${BACKEND_PUBLIC_URL || "não definida"}`);
     });
   } catch (error) {
     logError("Erro ao iniciar servidor", error);
