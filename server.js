@@ -22,7 +22,7 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-signature"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-signature", "x-request-id"],
   })
 );
 
@@ -49,6 +49,9 @@ const ORDER_ACCESS_LINK_TTL_DAYS = Number(process.env.ORDER_ACCESS_LINK_TTL_DAYS
 const MAX_DOWNLOADS_PER_ORDER = Number(process.env.MAX_DOWNLOADS_PER_ORDER || 5);
 const MAX_ACCESS_ATTEMPTS_PER_WINDOW = Number(process.env.MAX_ACCESS_ATTEMPTS_PER_WINDOW || 5);
 const ACCESS_ATTEMPT_WINDOW_MINUTES = Number(process.env.ACCESS_ATTEMPT_WINDOW_MINUTES || 15);
+
+// 5 minutos para reduzir replay de webhook
+const WEBHOOK_MAX_AGE_MS = 5 * 60 * 1000;
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
@@ -150,10 +153,20 @@ async function initDb() {
     );
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS processed_webhooks (
+      id BIGSERIAL PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      payment_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   await query(`CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_orders_access_token ON orders(access_token);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_download_sessions_token ON download_sessions(session_token);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_access_attempts_token_created_at ON access_attempts(access_token, created_at);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_processed_webhooks_request_id ON processed_webhooks(request_id);`);
 }
 
 function mpHeaders(idempotencyKey) {
@@ -187,6 +200,119 @@ function extractWebhookPaymentId(req) {
   );
 }
 
+function parseXSignature(signatureHeader = "") {
+  const parts = Object.fromEntries(
+    String(signatureHeader)
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const [key, ...rest] = part.split("=");
+        return [key, rest.join("=")];
+      })
+      .filter(([key, value]) => key && value)
+  );
+
+  return {
+    ts: parts.ts || "",
+    v1: parts.v1 || "",
+  };
+}
+
+function safeEqualHex(a, b) {
+  try {
+    const bufA = Buffer.from(String(a), "hex");
+    const bufB = Buffer.from(String(b), "hex");
+
+    if (!bufA.length || !bufB.length || bufA.length !== bufB.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeWebhookTimestamp(ts) {
+  const raw = String(ts || "").trim();
+  if (!/^\d+$/.test(raw)) return NaN;
+
+  // aceita segundos (10 dígitos) ou milissegundos (13 dígitos)
+  if (raw.length <= 10) {
+    return Number(raw) * 1000;
+  }
+
+  return Number(raw);
+}
+
+async function hasProcessedWebhook(requestId) {
+  const result = await query(
+    `SELECT 1 FROM processed_webhooks WHERE request_id = $1 LIMIT 1`,
+    [requestId]
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function markWebhookProcessed(requestId, paymentId = null) {
+  await query(
+    `INSERT INTO processed_webhooks (request_id, payment_id)
+     VALUES ($1, $2)
+     ON CONFLICT (request_id) DO NOTHING`,
+    [requestId, paymentId ? String(paymentId) : null]
+  );
+}
+
+async function validateWebhookSignature(req) {
+  if (!MP_WEBHOOK_SECRET) {
+    return { valid: true, requestId: req.headers["x-request-id"] || null };
+  }
+
+  const signatureHeader = req.headers["x-signature"];
+  const requestId = req.headers["x-request-id"];
+
+  if (!signatureHeader || !requestId) {
+    return { valid: false, reason: "Cabeçalhos obrigatórios ausentes." };
+  }
+
+  const { ts, v1 } = parseXSignature(signatureHeader);
+
+  if (!ts || !v1) {
+    return { valid: false, reason: "Assinatura incompleta." };
+  }
+
+  const tsMs = normalizeWebhookTimestamp(ts);
+  if (!Number.isFinite(tsMs)) {
+    return { valid: false, reason: "Timestamp inválido." };
+  }
+
+  const age = Math.abs(Date.now() - tsMs);
+  if (age > WEBHOOK_MAX_AGE_MS) {
+    return { valid: false, reason: "Webhook fora da janela de tempo." };
+  }
+
+  const dataId = extractWebhookPaymentId(req);
+  if (!dataId) {
+    return { valid: false, reason: "paymentId ausente no webhook." };
+  }
+
+  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+
+  const expected = crypto
+    .createHmac("sha256", MP_WEBHOOK_SECRET)
+    .update(manifest)
+    .digest("hex");
+
+  const valid = safeEqualHex(expected, v1);
+
+  return {
+    valid,
+    requestId,
+    paymentId: String(dataId),
+    reason: valid ? null : "Hash do webhook não confere.",
+  };
+}
+
 async function sendAccessEmail(order) {
   if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) {
     return false;
@@ -199,46 +325,46 @@ async function sendAccessEmail(order) {
       : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
 
   await resend.emails.send({
-  from: EMAIL_FROM,
-  to: order.email,
-  subject: `${PRODUCT_NAME} — pagamento confirmado`,
-  html: `
-    <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
-      <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
-      <p style="font-size:16px;line-height:1.6">
-        Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
-      </p>
-      <p style="font-size:16px;line-height:1.6">
-        Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
-      </p>
+    from: EMAIL_FROM,
+    to: order.email,
+    subject: `${PRODUCT_NAME} — pagamento confirmado`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
+        <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
+        <p style="font-size:16px;line-height:1.6">
+          Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
+        </p>
+        <p style="font-size:16px;line-height:1.6">
+          Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
+        </p>
 
-      <p style="font-size:15px;line-height:1.6;color:#444">
-        <strong>Importante:</strong> este pedido permite até <strong>${MAX_DOWNLOADS_PER_ORDER} downloads</strong> do arquivo.
-      </p>
+        <p style="font-size:15px;line-height:1.6;color:#444">
+          <strong>Importante:</strong> este pedido permite até <strong>${MAX_DOWNLOADS_PER_ORDER} downloads</strong> do arquivo.
+        </p>
 
-      <div style="margin:28px 0">
-        <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">
-          Acessar meu download
-        </a>
+        <div style="margin:28px 0">
+          <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">
+            Acessar meu download
+          </a>
+        </div>
+
+        <p style="font-size:14px;line-height:1.6;color:#444">
+          ${expiresText}
+        </p>
+
+        <p style="font-size:14px;line-height:1.6;color:#444">
+          Guarde este email para acessar novamente seu link quando precisar.
+        </p>
+
+        <p style="font-size:14px;line-height:1.6;color:#444">
+          Se o botão não funcionar, copie e cole este link no navegador:
+        </p>
+        <p style="word-break:break-all;font-size:13px;color:#444">
+          ${accessUrl}
+        </p>
       </div>
-
-      <p style="font-size:14px;line-height:1.6;color:#444">
-        ${expiresText}
-      </p>
-
-      <p style="font-size:14px;line-height:1.6;color:#444">
-        Guarde este email para acessar novamente seu link quando precisar.
-      </p>
-
-      <p style="font-size:14px;line-height:1.6;color:#444">
-        Se o botão não funcionar, copie e cole este link no navegador:
-      </p>
-      <p style="word-break:break-all;font-size:13px;color:#444">
-        ${accessUrl}
-      </p>
-    </div>
-  `,
-});
+    `,
+  });
 
   await query(
     `UPDATE orders
@@ -297,19 +423,6 @@ async function reconcileOrder(order) {
   }
 }
 
-async function validateWebhookSignature(req) {
-  if (!MP_WEBHOOK_SECRET) {
-    return true;
-  }
-
-  const signatureHeader = req.headers["x-signature"];
-  if (!signatureHeader) {
-    return false;
-  }
-
-  return true;
-}
-
 async function checkR2Health() {
   if (!r2 || !R2_BUCKET_NAME || !R2_OBJECT_KEY) {
     return { ok: false, error: "R2 não configurado" };
@@ -358,6 +471,7 @@ app.get("/health", async (req, res) => {
       r2: r2Ok,
       postgres: Boolean(process.env.DATABASE_URL),
       clientUrl: Boolean(CLIENT_URL),
+      webhookSecret: Boolean(MP_WEBHOOK_SECRET),
     },
     ...(r2Error ? { r2Error } : {}),
   });
@@ -501,18 +615,40 @@ app.get("/api/mercadopago/webhook", (req, res) => {
 
 async function handleWebhook(req, res) {
   try {
-    const validSignature = await validateWebhookSignature(req);
+    const validation = await validateWebhookSignature(req);
 
-    if (!validSignature) {
+    if (!validation.valid) {
+      logInfo("Webhook rejeitado", {
+        reason: validation.reason || "Assinatura inválida",
+        requestId: req.headers["x-request-id"] || null,
+        paymentId: extractWebhookPaymentId(req),
+      });
+
       return res.status(401).json({
         success: false,
         error: "Assinatura inválida.",
       });
     }
 
-    const paymentId = extractWebhookPaymentId(req);
+    if (validation.requestId && (await hasProcessedWebhook(validation.requestId))) {
+      logInfo("Webhook duplicado ignorado", {
+        requestId: validation.requestId,
+        paymentId: validation.paymentId || null,
+      });
+
+      return res.status(200).json({
+        success: true,
+        duplicate: true,
+      });
+    }
+
+    const paymentId = validation.paymentId || extractWebhookPaymentId(req);
 
     if (!paymentId) {
+      if (validation.requestId) {
+        await markWebhookProcessed(validation.requestId, null);
+      }
+
       return res.status(200).json({
         success: true,
         ignored: true,
@@ -522,7 +658,12 @@ async function handleWebhook(req, res) {
     const paymentData = await getPaymentById(paymentId);
     const order = await finalizeApprovedPayment(paymentData);
 
+    if (validation.requestId) {
+      await markWebhookProcessed(validation.requestId, paymentId);
+    }
+
     logInfo("Webhook processado", {
+      requestId: validation.requestId || null,
       paymentId,
       orderId: paymentData.external_reference,
       status: paymentData.status,
