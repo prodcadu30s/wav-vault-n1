@@ -20,7 +20,7 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
-    origin: "*",
+    origin: CLIENT_URL || "*",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "x-signature", "x-request-id"],
   })
@@ -313,7 +313,7 @@ async function validateWebhookSignature(req) {
   };
 }
 
-async function sendAccessEmail(order) {
+async function sendAccessEmail(order, { retries = 3, delayMs = 1000 } = {}) {
   if (!resend || !EMAIL_FROM || !BACKEND_PUBLIC_URL) {
     return false;
   }
@@ -324,56 +324,72 @@ async function sendAccessEmail(order) {
       ? `Este link-base pode expirar em ${ORDER_ACCESS_LINK_TTL_DAYS} dias.`
       : `Guarde este email. Você pode voltar aqui no futuro para gerar um novo download.`;
 
-  await resend.emails.send({
-    from: EMAIL_FROM,
-    to: order.email,
-    subject: `${PRODUCT_NAME} — pagamento confirmado`,
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
-        <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
-        <p style="font-size:16px;line-height:1.6">
-          Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
-        </p>
-        <p style="font-size:16px;line-height:1.6">
-          Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
-        </p>
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
+      <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
+      <p style="font-size:16px;line-height:1.6">
+        Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
+      </p>
+      <p style="font-size:16px;line-height:1.6">
+        Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
+      </p>
 
-        <p style="font-size:15px;line-height:1.6;color:#444">
-          <strong>Importante:</strong> este pedido permite até <strong>${MAX_DOWNLOADS_PER_ORDER} downloads</strong> do arquivo.
-        </p>
+      <p style="font-size:15px;line-height:1.6;color:#444">
+        <strong>Importante:</strong> este pedido permite até <strong>${MAX_DOWNLOADS_PER_ORDER} downloads</strong> do arquivo.
+      </p>
 
-        <div style="margin:28px 0">
-          <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">
-            Acessar meu download
-          </a>
-        </div>
-
-        <p style="font-size:14px;line-height:1.6;color:#444">
-          ${expiresText}
-        </p>
-
-        <p style="font-size:14px;line-height:1.6;color:#444">
-          Guarde este email para acessar novamente seu link quando precisar.
-        </p>
-
-        <p style="font-size:14px;line-height:1.6;color:#444">
-          Se o botão não funcionar, copie e cole este link no navegador:
-        </p>
-        <p style="word-break:break-all;font-size:13px;color:#444">
-          ${accessUrl}
-        </p>
+      <div style="margin:28px 0">
+        <a href="${accessUrl}" style="background:#111;color:#fff;padding:14px 22px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">
+          Acessar meu download
+        </a>
       </div>
-    `,
-  });
 
-  await query(
-    `UPDATE orders
-     SET email_sent = TRUE, email_sent_at = NOW(), updated_at = NOW()
-     WHERE order_id = $1`,
-    [order.order_id]
-  );
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        ${expiresText}
+      </p>
 
-  return true;
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        Guarde este email para acessar novamente seu link quando precisar.
+      </p>
+
+      <p style="font-size:14px;line-height:1.6;color:#444">
+        Se o botão não funcionar, copie e cole este link no navegador:
+      </p>
+      <p style="word-break:break-all;font-size:13px;color:#444">
+        ${accessUrl}
+      </p>
+    </div>
+  `;
+
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await resend.emails.send({
+        from: EMAIL_FROM,
+        to: order.email,
+        subject: `${PRODUCT_NAME} — pagamento confirmado`,
+        html,
+      });
+
+      await query(
+        `UPDATE orders
+         SET email_sent = TRUE, email_sent_at = NOW(), updated_at = NOW()
+         WHERE order_id = $1`,
+        [order.order_id]
+      );
+
+      return true;
+    } catch (error) {
+      lastError = error;
+      logError(`Tentativa ${attempt}/${retries} de envio de email falhou`, error, { orderId: order.order_id });
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+      }
+    }
+  }
+
+  logError("Todas as tentativas de envio de email falharam", lastError, { orderId: order.order_id });
+  return false;
 }
 
 async function finalizeApprovedPayment(paymentData) {
@@ -499,7 +515,7 @@ async function handleCreatePix(req, res) {
       });
     }
 
-    const orderId = `order_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+    const orderId = `order_${randomToken(12)}`;
     const accessToken = randomToken(24);
     const accessLinkExpiresAt =
       ORDER_ACCESS_LINK_TTL_DAYS > 0 ? addDays(new Date(), ORDER_ACCESS_LINK_TTL_DAYS) : null;
@@ -985,6 +1001,11 @@ app.use((req, res) => {
 
 async function start() {
   try {
+    // Validação de variáveis críticas de produção
+    if (!MP_WEBHOOK_SECRET) {
+      throw new Error("MP_WEBHOOK_SECRET não configurado. Configure esta variável antes de iniciar o servidor.");
+    }
+
     await initDb();
 
     app.listen(PORT, () => {
