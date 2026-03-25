@@ -20,7 +20,7 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
-    origin: CLIENT_URL || "*",
+    origin: (process.env.CLIENT_URL || "").replace(/\/$/, "") || "*",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "x-signature", "x-request-id"],
   })
@@ -36,7 +36,7 @@ const resend = process.env.RESEND_API_KEY
   : null;
 
 const PORT = Number(process.env.PORT || 3000);
-const CLIENT_URL = process.env.CLIENT_URL || "";
+const CLIENT_URL = (process.env.CLIENT_URL || "").replace(/\/$/, "");
 const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || "").replace(/\/$/, "");
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";
 const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || "";
