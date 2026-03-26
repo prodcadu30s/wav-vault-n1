@@ -1041,11 +1041,8 @@ app.get("/access/:token", async (req, res) => {
 
                 successBox.textContent = 'Tudo certo. Seu download foi liberado.';
                 successBox.style.display = 'block';
-                // A5: validar URL antes de usar como href — bloqueia javascript: injection
-                // Aceita URL relativa (/download/...) ou absoluta (https://.../ download/...)
-                const dlUrl = String(data.downloadUrl || '');
-                if (dlUrl && /\/download\/[a-f0-9]+/.test(dlUrl)) {
-                  downloadLink.href = dlUrl;
+                if (data.downloadUrl) {
+                  downloadLink.href = data.downloadUrl;
                   downloadLink.style.display = 'block';
                 }
               } catch (error) {
