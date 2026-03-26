@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet"); // L4: security headers
 const dotenv = require("dotenv");
 const axios = require("axios");
 const crypto = require("crypto");
@@ -17,18 +18,47 @@ dotenv.config();
 
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
+// L4: helmet — ~15 security headers (X-Frame-Options, HSTS, CSP, nosniff, etc.)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'unsafe-inline'"], // necessário para o inline JS da página /access/:token
+      styleSrc:   ["'unsafe-inline'"],
+    },
+  },
+}));
+
+// M7: JSON reviver — bloqueia prototype pollution (__proto__, constructor, prototype)
+app.use(express.json({
+  limit: "1mb",
+  reviver: (key, value) => {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") return undefined;
+    return value;
+  },
+}));
+
 app.use(
   cors({
-    origin: (process.env.CLIENT_URL || "").replace(/\/$/, "") || "*",
+    origin: process.env.CLIENT_URL
+      ? process.env.CLIENT_URL.replace(/\/$/, "")
+      : false,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "x-signature", "x-request-id"],
   })
 );
 
+// C3: trust proxy configurável — set TRUST_PROXY=1 em Railway/Render para obter IP real via req.ip
+if (process.env.TRUST_PROXY) {
+  app.set("trust proxy", Number(process.env.TRUST_PROXY) || 1);
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  // L3: rejectUnauthorized configurável — set DATABASE_SSL_REJECT_UNAUTHORIZED=true se o provedor tiver cert válido
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === "true" }
+    : false,
 });
 
 const resend = process.env.RESEND_API_KEY
@@ -42,6 +72,8 @@ const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";
 const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const PRODUCT_NAME = process.env.PRODUCT_NAME || "WAV Vault Vol. 1";
+// A9: sanitizar PRODUCT_NAME — elimina risco de header injection no email e XSS no HTML
+const SAFE_PRODUCT_NAME = PRODUCT_NAME.replace(/[\r\n<>"'&]/g, "");
 const PRODUCT_PRICE = Number(process.env.PRODUCT_PRICE || 49.99);
 const DOWNLOAD_SESSION_MINUTES = Number(process.env.DOWNLOAD_SESSION_MINUTES || 15);
 const R2_URL_EXPIRES_SECONDS = Number(process.env.R2_URL_EXPIRES_SECONDS || 300);
@@ -81,8 +113,38 @@ function logError(message, error, extra = {}) {
     ...extra,
     message: error?.message,
     response: error?.response?.data,
-    stack: error?.stack,
+    stack: process.env.NODE_ENV !== "production" ? error?.stack : undefined,
   });
+}
+
+// A2: mascarar tokens nos logs
+function maskToken(token) {
+  if (!token || token.length <= 8) return "***";
+  return token.slice(0, 8) + "...";
+}
+
+// A3: mascarar email nos logs
+function maskEmail(email) {
+  if (!email || !email.includes("@")) return "***";
+  const [local, domain] = email.split("@");
+  return local.slice(0, 2) + "***@" + domain;
+}
+
+// A4: escape HTML para interpolações seguras em HTML gerado
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+// M5: validação de formato de email
+function isValidEmail(email) {
+  return (
+    typeof email === "string" &&
+    email.length >= 3 &&
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
 }
 
 function randomToken(bytes = 24) {
@@ -110,6 +172,26 @@ function requireEnv(name, value) {
 async function query(text, params = []) {
   return pool.query(text, params);
 }
+
+// C1/C2: rate limiter em memória (sem dependência externa, adequado para processo único)
+const rateLimitStore = new Map();
+function checkRateLimit(key, maxRequests, windowMs) {
+  if (!key) return false;
+  const now = Date.now();
+  const entry = rateLimitStore.get(key);
+  if (!entry || now > entry.resetAt) {
+    rateLimitStore.set(key, { count: 1, resetAt: now + windowMs });
+    return false;
+  }
+  if (entry.count >= maxRequests) return true;
+  entry.count++;
+  return false;
+}
+// Limpar entradas expiradas a cada 10 min para não vazar memória
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitStore) if (now > v.resetAt) rateLimitStore.delete(k);
+}, 10 * 60 * 1000).unref();
 
 async function initDb() {
   await query(`
@@ -167,7 +249,14 @@ async function initDb() {
   await query(`CREATE INDEX IF NOT EXISTS idx_orders_access_token ON orders(access_token);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_download_sessions_token ON download_sessions(session_token);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_access_attempts_token_created_at ON access_attempts(access_token, created_at);`);
+  // C3/A7: índice por IP para rate limit no /payment-success
+  await query(`CREATE INDEX IF NOT EXISTS idx_access_attempts_ip_created_at ON access_attempts(ip_address, created_at);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_processed_webhooks_request_id ON processed_webhooks(request_id);`);
+
+  // M3/M4/M8: limpar registros antigos a cada restart — maném performance dos índices
+  await query(`DELETE FROM processed_webhooks WHERE created_at < NOW() - INTERVAL '7 days';`);
+  await query(`DELETE FROM access_attempts   WHERE created_at < NOW() - INTERVAL '30 days';`);
+  await query(`DELETE FROM download_sessions  WHERE created_at < NOW() - INTERVAL '30 days';`);
 }
 
 function mpHeaders(idempotencyKey) {
@@ -184,17 +273,20 @@ function mpHeaders(idempotencyKey) {
 }
 
 async function getPaymentById(paymentId) {
+  // C6: timeout de 10s — sem timeout a chamada pode travar indefinidamente e esgotar o pool do banco
   const response = await axios.get(
     `https://api.mercadopago.com/v1/payments/${paymentId}`,
-    { headers: mpHeaders() }
+    { headers: mpHeaders(), timeout: 10000 }
   );
   return response.data;
 }
 
 function extractWebhookPaymentId(req) {
+  // M1: truncar resource antes de split() — evita alocação excessiva / ReDoS
+  const resource = String(req.body?.resource || "").slice(0, 500);
   return (
     req.body?.data?.id ||
-    req.body?.resource?.split("/").pop() ||
+    resource.split("/").pop() ||
     req.query?.["data.id"] ||
     req.query?.id ||
     null
@@ -296,6 +388,11 @@ async function validateWebhookSignature(req) {
     return { valid: false, reason: "paymentId ausente no webhook." };
   }
 
+  // A8: garantir que paymentId é numérico — evita path traversal na URL da API do MP
+  if (!/^\d+$/.test(String(dataId))) {
+    return { valid: false, reason: "paymentId com formato inválido." };
+  }
+
   const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
 
   const expected = crypto
@@ -328,7 +425,7 @@ async function sendAccessEmail(order, { retries = 3, delayMs = 1000 } = {}) {
     <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111">
       <h1 style="margin:0 0 12px">Pagamento confirmado</h1>
       <p style="font-size:16px;line-height:1.6">
-        Seu pagamento de <strong>${PRODUCT_NAME}</strong> foi aprovado.
+        Seu pagamento de <strong>${escapeHtml(SAFE_PRODUCT_NAME)}</strong> foi aprovado.
       </p>
       <p style="font-size:16px;line-height:1.6">
         Clique no botão abaixo para acessar sua página de download. Nela, você informará o email usado na compra para liberar um link temporário do arquivo.
@@ -367,7 +464,8 @@ async function sendAccessEmail(order, { retries = 3, delayMs = 1000 } = {}) {
       await resend.emails.send({
         from: EMAIL_FROM,
         to: order.email,
-        subject: `${PRODUCT_NAME} — pagamento confirmado`,
+        // A9: usar SAFE_PRODUCT_NAME — elimitana header injection (\r\n no subject) e XSS no HTML
+        subject: `${SAFE_PRODUCT_NAME} — pagamento confirmado`,
         html,
       });
 
@@ -396,21 +494,50 @@ async function finalizeApprovedPayment(paymentData) {
   const orderId = paymentData.external_reference;
   if (!orderId) return null;
 
-  const result = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+  const result = await query(
+    `SELECT order_id, email, status, payment_status, payment_id, email_sent,
+            download_count, access_token, access_link_expires_at
+     FROM orders WHERE order_id = $1 LIMIT 1`,
+    [orderId]
+  );
   const order = result.rows[0];
   if (!order) return null;
 
+  // C5: verificar que o paymentId do webhook bate com o que o servidor registrou
+  // Impede external_reference hijacking: atacante não consegue aprovar pedidos alheios
+  // criando um pagamento próprio com external_reference de outra pessoa.
+  if (order.payment_id && String(paymentData.id) !== order.payment_id) {
+    logError("Mismatch de paymentId no webhook — possível hijacking", null, {
+      orderId,
+      expected: order.payment_id,
+      received: String(paymentData.id),
+    });
+    return null;
+  }
+
+  // C4: chargeback/reembolso REVOGA o acesso ao download
+  // O campo `status` agora desce para 'revoked' em caso de cancelamento/estorno.
+  // O check `session.status !== 'approved'` no /download bloqueia automaticamente.
   await query(
     `UPDATE orders
      SET payment_id = $2,
          payment_status = $3,
-         status = CASE WHEN $3 = 'approved' THEN 'approved' ELSE status END,
+         status = CASE
+           WHEN $3 = 'approved'                              THEN 'approved'
+           WHEN $3 IN ('refunded','charged_back','cancelled') THEN 'revoked'
+           ELSE status
+         END,
          updated_at = NOW()
      WHERE order_id = $1`,
     [orderId, String(paymentData.id), paymentData.status]
   );
 
-  const updatedResult = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+  const updatedResult = await query(
+    `SELECT order_id, email, status, payment_status, payment_id, email_sent,
+            download_count, access_token, access_link_expires_at
+     FROM orders WHERE order_id = $1 LIMIT 1`,
+    [orderId]
+  );
   const updatedOrder = updatedResult.rows[0];
 
   if (paymentData.status === "approved" && !updatedOrder.email_sent) {
@@ -449,25 +576,23 @@ async function checkR2Health() {
   return { ok: true };
 }
 
+// L2: remover lista de endpoints — reduz superficie de reconhecimento para atacantes
 app.get("/", (req, res) => {
-  return res.status(200).json({
-    success: true,
-    message: "API online.",
-    endpoints: {
-      health: "/health",
-      createPix: "/api/mercadopago/create-pix",
-      paymentStatus: "/api/mercadopago/payment-status/:orderId",
-      webhook: "/api/mercadopago/webhook",
-      access: "/access/:token",
-      download: "/download/:sessionToken",
-    },
-  });
+  return res.status(200).json({ success: true, message: "API online." });
 });
 
+// L1: /health com auth opcional — set HEALTH_TOKEN na env para proteger
 app.get("/health", async (req, res) => {
+  const healthToken = process.env.HEALTH_TOKEN;
+  if (healthToken) {
+    const provided = req.headers["authorization"]?.replace("Bearer ", "");
+    if (provided !== healthToken) {
+      return res.status(401).json({ success: false, error: "Não autorizado." });
+    }
+  }
+
   let r2Ok = false;
   let r2Error = null;
-
   try {
     const r2Check = await checkR2Health();
     r2Ok = r2Check.ok;
@@ -477,6 +602,7 @@ app.get("/health", async (req, res) => {
     r2Error = error.message;
   }
 
+  // L1: remover pixExpirationMinutes e dados internos desnecessarios
   return res.json({
     ok: true,
     time: new Date().toISOString(),
@@ -488,7 +614,6 @@ app.get("/health", async (req, res) => {
       postgres: Boolean(process.env.DATABASE_URL),
       clientUrl: Boolean(CLIENT_URL),
       webhookSecret: Boolean(MP_WEBHOOK_SECRET),
-      pixExpirationMinutes: PIX_EXPIRATION_MINUTES,
     },
     ...(r2Error ? { r2Error } : {}),
   });
@@ -498,21 +623,26 @@ async function handleCreatePix(req, res) {
   try {
     requireEnv("MP_ACCESS_TOKEN", MP_ACCESS_TOKEN);
 
+    // C2: rate limit por IP — máx 3 criações de PIX por janela por IP
+    const ip = req.ip || req.socket?.remoteAddress || null;
+    if (checkRateLimit(`pix:${ip}`, 3, ACCESS_ATTEMPT_WINDOW_MINUTES * 60 * 1000)) {
+      return res.status(429).json({ success: false, error: "Muitas tentativas. Tente novamente mais tarde." });
+    }
+
     const email = normalizeEmail(req.body?.email);
     const confirmEmail = normalizeEmail(req.body?.confirmEmail);
 
     if (!email || !confirmEmail) {
-      return res.status(400).json({
-        success: false,
-        error: "Preencha os dois campos de email.",
-      });
+      return res.status(400).json({ success: false, error: "Preencha os dois campos de email." });
+    }
+
+    // M5: validação de formato de email
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
     }
 
     if (email !== confirmEmail) {
-      return res.status(400).json({
-        success: false,
-        error: "Os emails não coincidem.",
-      });
+      return res.status(400).json({ success: false, error: "Os emails não coincidem." });
     }
 
     const orderId = `order_${randomToken(12)}`;
@@ -526,13 +656,11 @@ async function handleCreatePix(req, res) {
       [orderId, email, accessToken, accessLinkExpiresAt]
     );
 
-    const pixExpiresAt = new Date(
-      Date.now() + PIX_EXPIRATION_MINUTES * 60 * 1000
-    ).toISOString();
+    const pixExpiresAt = new Date(Date.now() + PIX_EXPIRATION_MINUTES * 60 * 1000).toISOString();
 
     const paymentData = {
       transaction_amount: PRODUCT_PRICE,
-      description: PRODUCT_NAME,
+      description: SAFE_PRODUCT_NAME,
       payment_method_id: "pix",
       external_reference: orderId,
       payer: { email },
@@ -543,27 +671,22 @@ async function handleCreatePix(req, res) {
       paymentData.notification_url = `${BACKEND_PUBLIC_URL}/api/mercadopago/webhook`;
     }
 
+    // C6: timeout de 15s na criação do PIX
     const paymentResponse = await axios.post(
       "https://api.mercadopago.com/v1/payments",
       paymentData,
-      { headers: mpHeaders(orderId) }
+      { headers: mpHeaders(orderId), timeout: 15000 }
     );
 
     const payment = paymentResponse.data;
 
     await query(
-      `UPDATE orders
-       SET payment_id = $2, payment_status = $3, updated_at = NOW()
-       WHERE order_id = $1`,
+      `UPDATE orders SET payment_id = $2, payment_status = $3, updated_at = NOW() WHERE order_id = $1`,
       [orderId, String(payment.id), payment.status || "pending"]
     );
 
-    logInfo("Pix criado", {
-      orderId,
-      paymentId: payment.id,
-      email,
-      pixExpiresAt,
-    });
+    // A3: mascarar email no log
+    logInfo("Pix criado", { orderId, paymentId: payment.id, email: maskEmail(email), pixExpiresAt });
 
     return res.json({
       success: true,
@@ -576,10 +699,8 @@ async function handleCreatePix(req, res) {
     });
   } catch (error) {
     logError("Erro ao criar Pix", error);
-    return res.status(500).json({
-      success: false,
-      error: error?.response?.data?.message || error.message || "Erro ao criar Pix.",
-    });
+    // M9: não expor mensagem interna do MP ao cliente
+    return res.status(500).json({ success: false, error: "Erro ao processar pagamento. Tente novamente." });
   }
 }
 
@@ -589,7 +710,24 @@ app.post("/api/mercadopago/create-pix", handleCreatePix);
 async function handlePaymentStatus(req, res) {
   try {
     const { orderId } = req.params;
-    const result = await query(`SELECT * FROM orders WHERE order_id = $1 LIMIT 1`, [orderId]);
+
+    // M2: validar tamanho do orderId
+    if (!orderId || orderId.length > 200) {
+      return res.status(400).json({ success: false, error: "ID inválido." });
+    }
+
+    // C1: rate limit por IP — máx 30 polls por minuto
+    const ip = req.ip || req.socket?.remoteAddress || null;
+    if (checkRateLimit(`status:${ip}`, 30, 60 * 1000)) {
+      return res.status(429).json({ success: false, error: "Muitas tentativas. Tente novamente mais tarde." });
+    }
+
+    const result = await query(
+      `SELECT order_id, status, payment_status, payment_id, email_sent,
+              download_count, access_link_expires_at
+       FROM orders WHERE order_id = $1 LIMIT 1`,
+      [orderId]
+    );
     let order = result.rows[0];
 
     if (!order) {
@@ -606,10 +744,9 @@ async function handlePaymentStatus(req, res) {
       status: order.status,
       paymentStatus: order.payment_status,
       emailSent: order.email_sent,
-      accessUrl:
-        order.status === "approved" && BACKEND_PUBLIC_URL
-          ? `${BACKEND_PUBLIC_URL}/access/${order.access_token}`
-          : null,
+      // FIX #4: accessUrl removido — o link de acesso chega SOMENTE por email
+      // Expor o accessUrl aqui permitiria que qualquer pessoa com o orderId
+      // (que é público) obtivesse o link sem precisar do email da compra.
     });
   } catch (error) {
     logError("Erro ao consultar status do pagamento", error, {
@@ -624,6 +761,107 @@ async function handlePaymentStatus(req, res) {
 
 app.get("/payment-status/:orderId", handlePaymentStatus);
 app.get("/api/mercadopago/payment-status/:orderId", handlePaymentStatus);
+
+// Endpoint Opção C: retorna o accessUrl SOMENTE se o pedido está aprovado
+// E o email informado bate com o email da compra.
+// Usado pelo frontend para redirecionar o comprador imediatamente após o pagamento,
+// sem esperar o email — mas sem expor o link para quem não tem o email da compra.
+async function handlePaymentSuccess(req, res) {
+  try {
+    const { orderId } = req.params;
+    const email = normalizeEmail(req.body?.email);
+    const ipAddress =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket.remoteAddress ||
+      null;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: "Informe o email usado na compra.",
+      });
+    }
+
+    // Rate limiting: reutiliza a tabela access_attempts para bloquear brute force
+    // de orderId + email. Conta tentativas falhas do IP na janela de tempo.
+    const attemptsResult = await query(
+      `SELECT COUNT(*)::int AS total
+       FROM access_attempts
+       WHERE ip_address = $1
+         AND created_at >= NOW() - ($2 || ' minutes')::interval
+         AND success = FALSE`,
+      [ipAddress, ACCESS_ATTEMPT_WINDOW_MINUTES]
+    );
+
+    if (attemptsResult.rows[0].total >= MAX_ACCESS_ATTEMPTS_PER_WINDOW) {
+      return res.status(429).json({
+        success: false,
+        error: "Muitas tentativas. Tente novamente mais tarde.",
+      });
+    }
+
+    const result = await query(
+      `SELECT order_id, email, status, payment_status, access_token, access_link_expires_at
+       FROM orders WHERE order_id = $1 LIMIT 1`,
+      [orderId]
+    );
+    const order = result.rows[0];
+
+    // A1: delay constante antes de erros — reduz timing side-channel
+    const genericError = async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return res.status(401).json({
+        success: false,
+        error: "Dados não conferem ou pagamento ainda não aprovado.",
+      });
+    };
+
+    if (!order) {
+      await query(
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [orderId, maskEmail(email), ipAddress]
+      );
+      return genericError();
+    }
+
+    if (order.status !== "approved") {
+      return genericError();
+    }
+
+    if (normalizeEmail(order.email) !== email) {
+      await query(
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [order.access_token, maskEmail(email), ipAddress]
+      );
+      return genericError();
+    }
+
+    if (order.access_link_expires_at && new Date(order.access_link_expires_at) < new Date()) {
+      return res.status(410).json({ success: false, error: "O link de acesso deste pedido expirou." });
+    }
+
+    await query(
+      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, TRUE)`,
+      [order.access_token, maskEmail(email), ipAddress]
+    );
+
+    // A3: mascarar email no log
+    logInfo("payment-success: accessUrl liberado", { orderId, email: maskEmail(email) });
+
+    return res.json({ success: true, accessUrl: `${BACKEND_PUBLIC_URL}/access/${order.access_token}` });
+  } catch (error) {
+    logError("Erro ao processar payment-success", error, {
+      orderId: req.params.orderId,
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Erro ao verificar pedido.",
+    });
+  }
+}
+
+app.post("/payment-success/:orderId", handlePaymentSuccess);
+app.post("/api/mercadopago/payment-success/:orderId", handlePaymentSuccess);
 
 app.get("/webhook", (req, res) => {
   return res.status(200).json({
@@ -711,7 +949,16 @@ app.post("/api/mercadopago/webhook", handleWebhook);
 app.get("/access/:token", async (req, res) => {
   try {
     const { token } = req.params;
-    const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
+    // M2: validar tamanho do token
+    if (!token || token.length > 200) {
+      return res.status(400).send("<h1>Token inválido</h1>");
+    }
+    const result = await query(
+      `SELECT order_id, email, status, payment_status, access_token,
+              access_link_expires_at, download_count
+       FROM orders WHERE access_token = $1 LIMIT 1`,
+      [token]
+    );
     const order = result.rows[0];
 
     if (!order) {
@@ -722,6 +969,8 @@ app.get("/access/:token", async (req, res) => {
       return res.status(410).send("<h1>Link expirado</h1><p>Este link-base expirou.</p>");
     }
 
+    // A4: usar SAFE_PRODUCT_NAME com escapeHtml no título da página
+    const safeTitle = escapeHtml(SAFE_PRODUCT_NAME);
     return res.send(`
       <!DOCTYPE html>
       <html lang="pt-BR">
@@ -744,7 +993,7 @@ app.get("/access/:token", async (req, res) => {
         </head>
         <body>
           <div class="card">
-            <h1>${PRODUCT_NAME}</h1>
+          <h1>${safeTitle}</h1>
             <p>Digite o email usado na compra para liberar seu download.</p>
             <input id="email" type="email" placeholder="Seu email de compra" />
             <button class="primary" id="submit">Liberar download</button>
@@ -782,8 +1031,11 @@ app.get("/access/:token", async (req, res) => {
 
                 successBox.textContent = 'Tudo certo. Seu download foi liberado.';
                 successBox.style.display = 'block';
-                downloadLink.href = data.downloadUrl;
-                downloadLink.style.display = 'block';
+                // A5: validar URL antes de usar como href (evita javascript: injection)
+                if (data.downloadUrl && String(data.downloadUrl).startsWith('/download/')) {
+                  downloadLink.href = data.downloadUrl;
+                  downloadLink.style.display = 'block';
+                }
               } catch (error) {
                 errorBox.textContent = error.message || 'Erro ao validar acesso.';
                 errorBox.style.display = 'block';
@@ -797,7 +1049,7 @@ app.get("/access/:token", async (req, res) => {
       </html>
     `);
   } catch (error) {
-    logError("Erro ao abrir página de acesso", error, { token: req.params.token });
+    logError("Erro ao abrir página de acesso", error, { token: maskToken(req.params.token) });
     return res.status(500).send("Erro ao abrir página de acesso.");
   }
 });
@@ -805,17 +1057,19 @@ app.get("/access/:token", async (req, res) => {
 app.post("/access/:token/confirm", async (req, res) => {
   try {
     const { token } = req.params;
+    // M2: validar tamanho do token
+    if (!token || token.length > 200) {
+      return res.status(400).json({ success: false, error: "Token inválido." });
+    }
     const email = normalizeEmail(req.body?.email);
-    const ipAddress =
-      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-      req.socket.remoteAddress ||
-      null;
+    const ipAddress = req.ip || req.socket?.remoteAddress || null;
 
     if (!email) {
-      return res.status(400).json({
-        success: false,
-        error: "Informe o email da compra.",
-      });
+      return res.status(400).json({ success: false, error: "Informe o email da compra." });
+    }
+    // M5: validação de formato de email
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
     }
 
     const attemptsResult = await query(
@@ -834,19 +1088,20 @@ app.post("/access/:token/confirm", async (req, res) => {
       });
     }
 
-    const result = await query(`SELECT * FROM orders WHERE access_token = $1 LIMIT 1`, [token]);
+    // FIX #6: SELECT explícito
+    const result = await query(
+      `SELECT order_id, email, status, access_link_expires_at, download_count
+       FROM orders WHERE access_token = $1 LIMIT 1`,
+      [token]
+    );
     const order = result.rows[0];
 
     if (!order) {
       await query(
-        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
-         VALUES ($1, $2, $3, FALSE)`,
-        [token, email, ipAddress]
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [token, maskEmail(email), ipAddress]
       );
-      return res.status(404).json({
-        success: false,
-        error: "Link inválido.",
-      });
+      return res.status(404).json({ success: false, error: "Link inválido." });
     }
 
     if (order.status !== "approved") {
@@ -863,6 +1118,8 @@ app.post("/access/:token/confirm", async (req, res) => {
       });
     }
 
+    // Pré-verificação do limite (não atômica, mas serve para feedback rápido ao usuário)
+    // A verificação atômica real acontece no /download/:sessionToken (FIX #2)
     if (
       Number(MAX_DOWNLOADS_PER_ORDER) > 0 &&
       Number(order.download_count) >= Number(MAX_DOWNLOADS_PER_ORDER)
@@ -875,20 +1132,33 @@ app.post("/access/:token/confirm", async (req, res) => {
 
     if (normalizeEmail(order.email) !== email) {
       await query(
-        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
-         VALUES ($1, $2, $3, FALSE)`,
-        [token, email, ipAddress]
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, FALSE)`,
+        [token, maskEmail(email), ipAddress]
       );
-      return res.status(401).json({
-        success: false,
-        error: "Email diferente do usado na compra.",
-      });
+      return res.status(401).json({ success: false, error: "Email diferente do usado na compra." });
+    }
+
+    // A7: verificar se já existe sessão ativa (não usada, não expirada) para este pedido
+    // Evita acumulo de múltiplas sessões em paralelo
+    const activeSession = await query(
+      `SELECT session_token FROM download_sessions
+       WHERE order_id = $1 AND used = FALSE AND expires_at > NOW()
+       LIMIT 1`,
+      [order.order_id]
+    );
+    if (activeSession.rows[0]) {
+      const existingToken = activeSession.rows[0].session_token;
+      await query(
+        `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, TRUE)`,
+        [token, maskEmail(email), ipAddress]
+      );
+      logInfo("Sessão ativa reutilizada", { orderId: order.order_id, sessionToken: maskToken(existingToken) });
+      return res.json({ success: true, downloadUrl: `${BACKEND_PUBLIC_URL}/download/${existingToken}` });
     }
 
     await query(
-      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success)
-       VALUES ($1, $2, $3, TRUE)`,
-      [token, email, ipAddress]
+      `INSERT INTO access_attempts (access_token, email_attempt, ip_address, success) VALUES ($1, $2, $3, TRUE)`,
+      [token, maskEmail(email), ipAddress]
     );
 
     const sessionToken = randomToken(24);
@@ -900,22 +1170,16 @@ app.post("/access/:token/confirm", async (req, res) => {
       [order.order_id, sessionToken, expiresAt]
     );
 
+    // A2: mascarar token no log
     logInfo("Sessão de download criada", {
       orderId: order.order_id,
-      sessionToken,
+      sessionToken: maskToken(sessionToken),
     });
 
-    return res.json({
-      success: true,
-      downloadUrl: `${BACKEND_PUBLIC_URL}/download/${sessionToken}`,
-      expiresAt,
-    });
+    return res.json({ success: true, downloadUrl: `${BACKEND_PUBLIC_URL}/download/${sessionToken}`, expiresAt });
   } catch (error) {
-    logError("Erro ao confirmar acesso", error, { token: req.params.token });
-    return res.status(500).json({
-      success: false,
-      error: "Erro ao validar acesso.",
-    });
+    logError("Erro ao confirmar acesso", error, { token: maskToken(req.params.token) });
+    return res.status(500).json({ success: false, error: "Erro ao validar acesso." });
   }
 });
 
@@ -924,14 +1188,18 @@ app.get("/download/:sessionToken", async (req, res) => {
     requireEnv("R2_BUCKET_NAME", R2_BUCKET_NAME);
     requireEnv("R2_OBJECT_KEY", R2_OBJECT_KEY);
 
-    if (!r2) {
-      throw new Error("R2 não configurado.");
-    }
+    if (!r2) throw new Error("R2 não configurado.");
 
     const { sessionToken } = req.params;
+    // M2: validar tamanho do sessionToken
+    if (!sessionToken || sessionToken.length > 200) {
+      return res.status(400).send("Token inválido.");
+    }
 
+    // FIX #3: buscar também o status do pedido para revalidar na hora do download
     const sessionResult = await query(
-      `SELECT ds.*, o.download_count, o.order_id
+      `SELECT ds.session_token, ds.used, ds.expires_at, ds.order_id,
+              o.download_count, o.status
        FROM download_sessions ds
        JOIN orders o ON o.order_id = ds.order_id
        WHERE ds.session_token = $1
@@ -953,6 +1221,31 @@ app.get("/download/:sessionToken", async (req, res) => {
       return res.status(410).send("Este link de download expirou.");
     }
 
+    // FIX #3: revalidar status do pedido (ex: chargeback após sessão criada)
+    if (session.status !== "approved") {
+      return res.status(403).send("Pedido não está aprovado.");
+    }
+
+    // FIX #2: UPDATE atômico com verificação de limite
+    // Incrementa download_count SOMENTE se ainda estiver abaixo do limite.
+    // Isso elimina a race condition: duas requisições simultâneas não podem
+    // ambas passar, pois o banco garante atomicidade do UPDATE.
+    const updateResult = await query(
+      `UPDATE orders
+       SET download_count = download_count + 1,
+           last_download_at = NOW(),
+           updated_at = NOW()
+       WHERE order_id = $1
+         AND (download_count < $2 OR $2 = 0)
+       RETURNING download_count`,
+      [session.order_id, MAX_DOWNLOADS_PER_ORDER]
+    );
+
+    if (updateResult.rowCount === 0) {
+      // Limite atingido — outra requisição simultânea já consumiu o último slot
+      return res.status(403).send("Limite de downloads atingido.");
+    }
+
     const command = new GetObjectCommand({
       Bucket: R2_BUCKET_NAME,
       Key: R2_OBJECT_KEY,
@@ -962,6 +1255,7 @@ app.get("/download/:sessionToken", async (req, res) => {
       expiresIn: R2_URL_EXPIRES_SECONDS,
     });
 
+    // Marcar sessão como usada somente após garantir o slot (FIX #2)
     await query(
       `UPDATE download_sessions
        SET used = TRUE, used_at = NOW()
@@ -969,25 +1263,15 @@ app.get("/download/:sessionToken", async (req, res) => {
       [sessionToken]
     );
 
-    await query(
-      `UPDATE orders
-       SET download_count = download_count + 1,
-           last_download_at = NOW(),
-           updated_at = NOW()
-       WHERE order_id = $1`,
-      [session.order_id]
-    );
-
     logInfo("Download liberado", {
       orderId: session.order_id,
-      sessionToken,
+      sessionToken: maskToken(sessionToken),
+      newDownloadCount: updateResult.rows[0]?.download_count,
     });
 
     return res.redirect(signedUrl);
   } catch (error) {
-    logError("Erro ao liberar download", error, {
-      sessionToken: req.params.sessionToken,
-    });
+    logError("Erro ao liberar download", error, { sessionToken: maskToken(req.params.sessionToken) });
     return res.status(500).send("Erro ao liberar download.");
   }
 });
@@ -1001,17 +1285,20 @@ app.use((req, res) => {
 
 async function start() {
   try {
-    // Validação de variáveis críticas de produção
     if (!MP_WEBHOOK_SECRET) {
       throw new Error("MP_WEBHOOK_SECRET não configurado. Configure esta variável antes de iniciar o servidor.");
     }
 
     await initDb();
 
-    app.listen(PORT, () => {
+    // A6: timeouts de servidor — mitiga Slowloris e conexões penduradas indefinidamente
+    const server = app.listen(PORT, () => {
       console.log(`Servidor rodando na porta ${PORT}`);
       console.log(`URL pública esperada: ${BACKEND_PUBLIC_URL || "não definida"}`);
     });
+    server.headersTimeout  = 15000; // 15s para receber todos os headers
+    server.requestTimeout  = 60000; // 60s para completar a requisição
+    server.keepAliveTimeout = 5000; // fecha conexões idle
   } catch (error) {
     logError("Erro ao iniciar servidor", error);
     process.exit(1);
