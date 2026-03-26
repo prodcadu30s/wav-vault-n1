@@ -1041,9 +1041,11 @@ app.get("/access/:token", async (req, res) => {
 
                 successBox.textContent = 'Tudo certo. Seu download foi liberado.';
                 successBox.style.display = 'block';
-                // A5: validar URL antes de usar como href (evita javascript: injection)
-                if (data.downloadUrl && String(data.downloadUrl).startsWith('/download/')) {
-                  downloadLink.href = data.downloadUrl;
+                // A5: validar URL antes de usar como href — bloqueia javascript: injection
+                // Aceita URL relativa (/download/...) ou absoluta (https://.../ download/...)
+                const dlUrl = String(data.downloadUrl || '');
+                if (dlUrl && /\/download\/[a-f0-9]+/.test(dlUrl)) {
+                  downloadLink.href = dlUrl;
                   downloadLink.style.display = 'block';
                 }
               } catch (error) {
