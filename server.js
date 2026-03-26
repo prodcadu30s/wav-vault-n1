@@ -769,11 +769,15 @@ app.get("/api/mercadopago/payment-status/:orderId", handlePaymentStatus);
 async function handlePaymentSuccess(req, res) {
   try {
     const { orderId } = req.params;
+
+    // M2: validar tamanho do orderId
+    if (!orderId || orderId.length > 200) {
+      return res.status(400).json({ success: false, error: "ID inválido." });
+    }
+
     const email = normalizeEmail(req.body?.email);
-    const ipAddress =
-      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-      req.socket.remoteAddress ||
-      null;
+    // C3: usar req.ip (respeita trust proxy) em vez de parsear X-Forwarded-For manualmente
+    const ipAddress = req.ip || req.socket?.remoteAddress || null;
 
     if (!email) {
       return res.status(400).json({
@@ -781,6 +785,12 @@ async function handlePaymentSuccess(req, res) {
         error: "Informe o email usado na compra.",
       });
     }
+
+    // M5: validação de formato de email
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
+    }
+
 
     // Rate limiting: reutiliza a tabela access_attempts para bloquear brute force
     // de orderId + email. Conta tentativas falhas do IP na janela de tempo.
