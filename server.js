@@ -23,8 +23,8 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc:  ["'unsafe-inline'"], // necessário para o inline JS da página /access/:token
-      styleSrc:   ["'unsafe-inline'"],
+      scriptSrc: ["'unsafe-inline'"], // necessário para o inline JS da página /access/:token
+      styleSrc: ["'unsafe-inline'"],
     },
   },
 }));
@@ -95,13 +95,13 @@ const R2_OBJECT_KEY = process.env.R2_OBJECT_KEY || "";
 const r2 =
   R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY
     ? new S3Client({
-        region: "auto",
-        endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-        credentials: {
-          accessKeyId: R2_ACCESS_KEY_ID,
-          secretAccessKey: R2_SECRET_ACCESS_KEY,
-        },
-      })
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+      },
+    })
     : null;
 
 function logInfo(message, extra = {}) {
@@ -1305,8 +1305,8 @@ async function start() {
       console.log(`Servidor rodando na porta ${PORT}`);
       console.log(`URL pública esperada: ${BACKEND_PUBLIC_URL || "não definida"}`);
     });
-    server.headersTimeout  = 15000; // 15s para receber todos os headers
-    server.requestTimeout  = 60000; // 60s para completar a requisição
+    server.headersTimeout = 15000; // 15s para receber todos os headers
+    server.requestTimeout = 60000; // 60s para completar a requisição
     server.keepAliveTimeout = 5000; // fecha conexões idle
   } catch (error) {
     logError("Erro ao iniciar servidor", error);
